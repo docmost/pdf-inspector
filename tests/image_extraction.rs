@@ -5,6 +5,7 @@ use flate2::Compression;
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream};
 use pdf_inspector::{
     extract_images_mem, process_pdf_mem_with_options, ImageFormat, PdfOptions, PdfProcessResult,
+    PdfType,
 };
 use std::io::Write;
 
@@ -58,6 +59,19 @@ impl PdfBuilder {
         self.image(dict, data)
     }
 
+    fn scan_image(&mut self) -> ObjectId {
+        let dict = dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 2550,
+            "Height" => 3300,
+            "BitsPerComponent" => 8,
+            "ColorSpace" => "DeviceGray",
+            "Filter" => "DCTDecode",
+        };
+        self.doc.add_object(Stream::new(dict, jpeg(9)))
+    }
+
     fn form(&mut self, xobjects: Dictionary, painting: &str) -> ObjectId {
         let dict = dictionary! {
             "Type" => "XObject",
@@ -76,9 +90,15 @@ impl PdfBuilder {
                 format!("BT /F1 12 Tf 72 {y} Td (Page body text, line {line} of the words above the image) Tj ET\n")
             })
             .collect();
-        let content = format!(
-            "{body}BT /F1 12 Tf 72 400 Td (A second line further down that page) Tj ET\n{painting}"
+        self.raw_page(
+            xobjects,
+            format!(
+                "{body}BT /F1 12 Tf 72 400 Td (A second line further down that page) Tj ET\n{painting}"
+            ),
         );
+    }
+
+    fn raw_page(&mut self, xobjects: Dictionary, content: String) {
         let content_id = self
             .doc
             .add_object(Stream::new(dictionary! {}, content.into_bytes()));
@@ -331,4 +351,55 @@ fn image_free_document_returns_no_images() {
 
     assert!(result.images.is_empty());
     assert!(!markdown(&result).contains("pdf-image://"));
+}
+
+const PAINT_SCAN: &str = "q 612 0 0 792 0 0 cm /Im0 Do Q";
+
+fn ocr_layer() -> String {
+    (0..30)
+        .map(|line| {
+            let y = 740 - line * 20;
+            format!(
+                "BT 3 Tr /F1 10 Tf 60 {y} Td (Recognized words on line {line} of a scan) Tj ET\n"
+            )
+        })
+        .collect()
+}
+
+fn ocr_scan_pdf() -> Vec<u8> {
+    let mut pdf = PdfBuilder::new();
+    let scan = pdf.scan_image();
+    let content = format!("{PAINT_SCAN}\n{}", ocr_layer());
+    pdf.raw_page(dictionary! { "Im0" => scan }, content);
+    pdf.build()
+}
+
+#[test]
+fn ocr_scan_keeps_its_page_images() {
+    let result = with_images(&ocr_scan_pdf());
+
+    assert!(matches!(result.pdf_type, PdfType::ImageBased));
+    assert_eq!(result.images.len(), 1);
+    assert_eq!(result.images[0].data, jpeg(9));
+    assert!(markdown(&result).contains("pdf-image://0"));
+}
+
+#[test]
+fn ocr_scan_stays_empty_unless_images_are_asked_for() {
+    let result = process_pdf_mem_with_options(&ocr_scan_pdf(), PdfOptions::new()).unwrap();
+
+    assert!(result.markdown.is_none());
+    assert!(result.images.is_empty());
+}
+
+#[test]
+fn scan_without_a_text_layer_returns_nothing() {
+    let mut pdf = PdfBuilder::new();
+    let scan = pdf.scan_image();
+    pdf.raw_page(dictionary! { "Im0" => scan }, PAINT_SCAN.to_string());
+
+    let result = with_images(&pdf.build());
+
+    assert!(result.markdown.is_none());
+    assert!(result.images.is_empty());
 }

@@ -10,6 +10,7 @@ use crate::tounicode::FontCMaps;
 use crate::types::{ItemType, TextItem};
 use crate::PdfError;
 use lopdf::{Document, Object, ObjectId};
+use std::collections::BTreeMap;
 
 /// Scheme of the markdown placeholders: `pdf-image://N` is `images[N]`.
 pub(crate) const PDF_IMAGE_SCHEME: &str = "pdf-image://";
@@ -53,6 +54,16 @@ pub fn extract_images_mem(buffer: &[u8]) -> Result<Vec<ExtractedImage>, PdfError
     let font_cmaps = FontCMaps::from_doc(&doc);
     let ((mut items, _, _), ..) = extract_positioned_text_from_doc(&doc, &font_cmaps, None)?;
     Ok(collect_images(&doc, &mut items))
+}
+
+/// Whether a document classified as a scan carries an invisible text layer.
+/// Upstream stops there and leaves such a scan to the caller's OCR. Docmost has
+/// no OCR step, so the page rasters are the only copy of those pages it can keep.
+pub(crate) fn has_invisible_text_layer(ocr_reasons_by_page: &BTreeMap<u32, Vec<String>>) -> bool {
+    ocr_reasons_by_page
+        .values()
+        .flatten()
+        .any(|reason| reason == crate::OCR_REASON_INVISIBLE_TEXT_LAYER)
 }
 
 /// What an Image item keeps in `font_tag`: the XObject it paints. The resource

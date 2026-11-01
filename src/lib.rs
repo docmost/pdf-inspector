@@ -4636,7 +4636,9 @@ fn process_document(
     }
 
     // Scanned / ImageBased → nothing to extract
-    if matches!(pdf_type, PdfType::Scanned | PdfType::ImageBased) {
+    let scan_keeps_images = options.extract_images
+        && extractor::images::has_invisible_text_layer(&detection_ocr_reasons);
+    if matches!(pdf_type, PdfType::Scanned | PdfType::ImageBased) && !scan_keeps_images {
         return Ok(PdfProcessResult {
             pdf_type,
             markdown: None,
