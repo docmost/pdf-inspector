@@ -2588,9 +2588,12 @@ fn has_chart_bar_signature(
                       breadth: fn(&(f32, f32, f32, f32)) -> f32,
                       length: fn(&(f32, f32, f32, f32)) -> f32,
                       along: fn(&(f32, f32, f32, f32)) -> f32| {
+        // The verdict depends on the breadth alone. A table repeats a few
+        // breadths across every cell, and testing each cell is cubic in rects.
+        let mut tried_breadths = HashSet::new();
         group_rects.iter().any(|anchor| {
             let bw = breadth(anchor);
-            if bw <= 0.0 {
+            if bw <= 0.0 || !tried_breadths.insert(bw.to_bits()) {
                 return false;
             }
             let family: Vec<&(f32, f32, f32, f32)> = group_rects
