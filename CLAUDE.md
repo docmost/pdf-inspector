@@ -30,6 +30,7 @@ src/
   extractor/
     mod.rs                      – top-level extraction orchestrator
     content_stream.rs           – PDF operator state machine (Tj/TJ/Td/Tm/q/Q)
+    geometry.rs                 – run boxes and baseline rotation shared by both content parsers
     fonts.rs                    – font width/encoding, CMapDecisionCache, TrueType cmap fallback
     layout.rs                   – column detection (histogram), newspaper/tabular classification,
                                   spanning-line pre-masking, sidebar detection
@@ -61,7 +62,7 @@ src/
 
 - **Unit tests**: inline `#[cfg(test)] mod tests` in each module with synthetic data.
 - **Integration tests**: `tests/integration_tests.rs` with fixture PDFs in `tests/fixtures/`.
-- **Regression suite**: sibling repo `pdf-evals` with 187+ snapshot PDFs. Run `cargo build --release` then `bench.py test` in that repo before committing.
+- **Regression suite**: sibling repo `pdf-evals` with ~200 snapshot PDFs. Run `cargo build --release` then `bench.py test` in that repo before committing. While iterating, prefer a subset run (`bench.py test -q` for the quick set, or `-s <name>` for a named test set) and save the full `bench.py test` for the final pre-commit check.
 - **Semantic quality**: run `bench.py score` in `pdf-evals` for the semantic verdict (TEDS + MHS + reading order + char/word + list preservation, composited). Character-level diff alone misclassifies structural improvements (e.g., column-detection rewrites) as regressions — `score` is the tie-breaker. See `pdf-evals/CLAUDE.md` "Semantic scoring".
 
 ## Debugging

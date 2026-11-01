@@ -4566,9 +4566,13 @@ pub fn glyph_to_char(name: &str) -> Option<char> {
         }
     }
 
-    // Try to parse uniXXXX format
-    if name.starts_with("uni") && name.len() >= 7 {
-        if let Ok(code) = u32::from_str_radix(&name[3..7], 16) {
+    // Try to parse uniXXXX format.
+    // Use `get` rather than a byte-length check + slice: `name` can contain
+    // non-ASCII bytes (e.g. U+FFFD from lossy UTF-8 decoding of an attacker
+    // controlled /Differences name), so byte index 7 may not be a char
+    // boundary and `&name[3..7]` would panic.
+    if let Some(hex) = name.strip_prefix("uni").and_then(|rest| rest.get(..4)) {
+        if let Ok(code) = u32::from_str_radix(hex, 16) {
             // Strip PUA F000 offset: uniF0XX → U+00XX (Windows Symbol encoding convention)
             let code = if (0xF000..=0xF0FF).contains(&code) {
                 code - 0xF000
@@ -4587,4 +4591,141 @@ pub fn glyph_to_char(name: &str) -> Option<char> {
     }
 
     None
+}
+
+/// The text a glyph name stands for, by the Adobe Glyph List Specification:
+/// a suffix from the first period is dropped (`a.sc`, `f_t.liga`); a `uni`
+/// name of several four-digit groups (`uni00660069`) or a `uXXXX` name is
+/// the code points it spells; a name of components joined by underscores
+/// (`f_t`, `f_f_i`, `T_h`) is the concatenation of what its components
+/// stand for, each resolved the same way; and the common ligature names the
+/// list itself lacks (`ft`, `st`, …) are their letters. `None` when any part
+/// is unknown, so a name that cannot be read stays unread rather than
+/// half-read.
+pub fn glyph_name_to_string(name: &str) -> Option<String> {
+    let base = name.split('.').next().filter(|base| !base.is_empty())?;
+    // Components first: `f_i` is the letters f and i even where the list
+    // also knows the joined name as a ligature code point. Every component
+    // must read, or the name does not.
+    if base.contains('_') {
+        return base.split('_').map(glyph_name_to_string).collect();
+    }
+    if let Some(&ch) = GLYPH_TO_UNICODE.get(base) {
+        return Some(ch.to_string());
+    }
+    // `uni` takes groups of exactly four hex digits, `u` four to six: a
+    // name with anything else after the prefix is not one of them.
+    if let Some(hex) = base.strip_prefix("uni") {
+        if hex.is_empty() || hex.len() % 4 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        return hex
+            .as_bytes()
+            .chunks(4)
+            .map(|group| {
+                let code = u32::from_str_radix(std::str::from_utf8(group).ok()?, 16).ok()?;
+                // Windows Symbol convention: uniF0XX stands for code XX.
+                let code = if (0xF000..=0xF0FF).contains(&code) {
+                    code - 0xF000
+                } else {
+                    code
+                };
+                char::from_u32(code)
+            })
+            .collect();
+    }
+    if let Some(hex) = base.strip_prefix('u') {
+        if !(4..=6).contains(&hex.len()) || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        return u32::from_str_radix(hex, 16)
+            .ok()
+            .and_then(char::from_u32)
+            .map(|ch| ch.to_string());
+    }
+    match base {
+        "ft" | "st" | "ct" | "tt" | "ti" | "tz" | "fj" | "fb" | "fh" | "fk" => {
+            Some(base.to_string())
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::glyph_name_to_string;
+
+    #[test]
+    fn component_names_spell_their_letters() {
+        assert_eq!(glyph_name_to_string("f_t").as_deref(), Some("ft"));
+        assert_eq!(glyph_name_to_string("f_f_i").as_deref(), Some("ffi"));
+        assert_eq!(glyph_name_to_string("T_h").as_deref(), Some("Th"));
+        assert_eq!(
+            glyph_name_to_string("uni0066_uni0069").as_deref(),
+            Some("fi")
+        );
+        // A component the list does not know leaves the whole name unread,
+        // a one-character one included.
+        assert_eq!(glyph_name_to_string("f_zzz"), None);
+        assert_eq!(glyph_name_to_string("f__t"), None);
+        assert_eq!(glyph_name_to_string("f_!"), None);
+    }
+
+    #[test]
+    fn suffixes_are_dropped_before_the_lookup() {
+        assert_eq!(glyph_name_to_string("a.sc").as_deref(), Some("a"));
+        assert_eq!(glyph_name_to_string("f_i.liga").as_deref(), Some("fi"));
+        assert_eq!(glyph_name_to_string("zero.tf").as_deref(), Some("0"));
+        assert_eq!(glyph_name_to_string(".notdef"), None);
+    }
+
+    #[test]
+    fn uni_sequences_and_plain_ligature_names_are_read() {
+        assert_eq!(glyph_name_to_string("uni00660069").as_deref(), Some("fi"));
+        assert_eq!(glyph_name_to_string("uni03B1").as_deref(), Some("\u{03B1}"));
+        assert_eq!(glyph_name_to_string("uniF041").as_deref(), Some("A"));
+        assert_eq!(glyph_name_to_string("uniF041F042").as_deref(), Some("AB"));
+        assert_eq!(glyph_name_to_string("u1F600").as_deref(), Some("\u{1F600}"));
+        assert_eq!(glyph_name_to_string("fi").as_deref(), Some("\u{FB01}"));
+        assert_eq!(glyph_name_to_string("ft").as_deref(), Some("ft"));
+        assert_eq!(glyph_name_to_string("st").as_deref(), Some("st"));
+        assert_eq!(glyph_name_to_string("gid00136"), None);
+        // Malformed encoded names are not half-read.
+        assert_eq!(glyph_name_to_string("uni0066X"), None);
+        assert_eq!(glyph_name_to_string("uni006"), None);
+        assert_eq!(glyph_name_to_string("u12"), None);
+        assert_eq!(glyph_name_to_string("u1234567"), None);
+        // Names that merely start with those letters are looked up as names.
+        assert_eq!(glyph_name_to_string("union").as_deref(), Some("\u{222A}"));
+        assert_eq!(glyph_name_to_string("uacute").as_deref(), Some("\u{00FA}"));
+    }
+    use super::*;
+
+    #[test]
+    fn uni_hex_parsing() {
+        assert_eq!(glyph_to_char("uni0041"), Some('A'));
+        assert_eq!(glyph_to_char("uni00e9"), Some('\u{00e9}'));
+        // PUA F0xx symbol-encoding offset is stripped.
+        assert_eq!(glyph_to_char("uniF041"), Some('A'));
+    }
+
+    #[test]
+    fn u_hex_parsing() {
+        assert_eq!(glyph_to_char("u0041"), Some('A'));
+        assert_eq!(glyph_to_char("u1F600"), Some('\u{1F600}'));
+    }
+
+    #[test]
+    fn non_ascii_uni_name_does_not_panic() {
+        // A crafted /Differences name like `/uni#80#80#80#80` decodes via
+        // from_utf8_lossy into "uni" followed by four U+FFFD replacements.
+        // Byte index 7 lands mid-character, so a naive `&name[3..7]` slice
+        // would panic. It must be handled gracefully instead.
+        let crafted = format!("uni{0}{0}{0}{0}", '\u{FFFD}');
+        assert_eq!(glyph_to_char(&crafted), None);
+
+        // Assorted non-ASCII bytes right after the "uni" prefix.
+        assert_eq!(glyph_to_char("uni\u{FFFD}bc"), None);
+        assert_eq!(glyph_to_char("uni\u{00e9}00"), None);
+    }
 }

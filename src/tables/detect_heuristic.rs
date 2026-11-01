@@ -1,13 +1,13 @@
 //! Heuristic table detection and validation.
 
-use crate::text_utils::is_rtl_text;
 use crate::types::TextItem;
 use log::debug;
 
+use super::cell_text::join_cell_items;
 use super::financial::try_split_financial_item;
 use super::grid::{
     find_column_boundaries, find_column_index, find_row_boundaries, find_row_index,
-    join_cell_items, recover_header_row,
+    recover_header_row,
 };
 use super::{Table, TableDetectionMode};
 
@@ -18,12 +18,23 @@ use super::{Table, TableDetectionMode};
 ///
 /// Returns `(merged_items, index_map)` where `index_map[merged_idx]` contains
 /// the original item indices that were merged into that item.
+#[cfg(test)]
 pub(crate) fn merge_adjacent_items(items: &[TextItem]) -> (Vec<TextItem>, Vec<Vec<usize>>) {
+    merge_adjacent_items_preserving(items, &std::collections::HashSet::new())
+}
+
+fn merge_adjacent_items_preserving(
+    items: &[TextItem],
+    preserved_indices: &std::collections::HashSet<usize>,
+) -> (Vec<TextItem>, Vec<Vec<usize>>) {
     if items.is_empty() {
         return (vec![], vec![]);
     }
 
-    // Group items by Y position (5pt tolerance for same line)
+    // Group items by Y position (5pt tolerance for same line). Raw glyph
+    // baselines on purpose: see the note in `detect_lines::collect_anchored_rows`
+    // — clustering detection rows on `line_y()` changed which table hypotheses
+    // win on the eval corpus, so only cell assignment/rendering is script-aware.
     let y_tolerance = 5.0;
     let mut line_groups: Vec<(f32, Vec<(usize, &TextItem)>)> = Vec::new();
 
@@ -59,6 +70,7 @@ pub(crate) fn merge_adjacent_items(items: &[TextItem]) -> (Vec<TextItem>, Vec<Ve
             let (first_idx, first_item) = group[i];
             let mut text = first_item.text.clone();
             let mut end_x = first_item.x + first_item.width;
+            let mut box_right = first_item.x + first_item.width;
             let mut indices = vec![first_idx];
             let x_gap_max = first_item.font_size * 0.5;
 
@@ -68,6 +80,33 @@ pub(crate) fn merge_adjacent_items(items: &[TextItem]) -> (Vec<TextItem>, Vec<Ve
 
                 // Must be similar font size (within 20%)
                 if (next_item.font_size - first_item.font_size).abs() > first_item.font_size * 0.20
+                {
+                    break;
+                }
+
+                // Merging walks +x in reading order: a rotated table header
+                // (or an upside-down run) never joins a neighbouring cell,
+                // matching `merge_text_items`.
+                if !first_item.is_upright() || !next_item.is_upright() {
+                    break;
+                }
+                if first_item.advance_known != next_item.advance_known {
+                    break;
+                }
+
+                // Proven replacement cells must retain their own decoration.
+                // Otherwise an adjacent old/new pair inherits only the first
+                // fragment's flags and can lose the live table evidence.
+                let decoration_changes = indices.iter().any(|index| {
+                    let merged_item = &items[*index];
+                    next_item.is_underline != merged_item.is_underline
+                        || next_item.is_strikeout != merged_item.is_strikeout
+                });
+                if decoration_changes
+                    && (indices
+                        .iter()
+                        .any(|index| preserved_indices.contains(index))
+                        || preserved_indices.contains(&next_idx))
                 {
                     break;
                 }
@@ -89,6 +128,7 @@ pub(crate) fn merge_adjacent_items(items: &[TextItem]) -> (Vec<TextItem>, Vec<Ve
                 }
                 text.push_str(&next_item.text);
                 end_x = next_item.x + next_item.width;
+                box_right = box_right.max(next_item.x + next_item.width);
                 indices.push(next_idx);
                 j += 1;
             }
@@ -97,15 +137,44 @@ pub(crate) fn merge_adjacent_items(items: &[TextItem]) -> (Vec<TextItem>, Vec<Ve
                 text,
                 x: first_item.x,
                 y: first_item.y,
-                width: end_x - first_item.x,
+                width: if first_item.advance_known {
+                    end_x - first_item.x
+                } else {
+                    box_right - first_item.x
+                },
                 height: first_item.height,
                 font: first_item.font.clone(),
+                font_tag: first_item.font_tag.clone(),
+                legacy_symbol_rewrite: indices
+                    .iter()
+                    .any(|&index| items[index].legacy_symbol_rewrite),
                 font_size: first_item.font_size,
                 page: first_item.page,
                 is_bold: first_item.is_bold,
                 is_italic: first_item.is_italic,
+                font_weight: first_item.font_weight,
+                bold_source: first_item.bold_source,
+                fixed_pitch: first_item.fixed_pitch,
+                fill_color: first_item.fill_color,
+                stroke_color: first_item.stroke_color,
+                render_mode: first_item.render_mode,
+                is_underline: first_item.is_underline,
+                is_strikeout: first_item.is_strikeout,
+                rotation: first_item.rotation,
+                advance_known: first_item.advance_known,
                 item_type: first_item.item_type.clone(),
                 mcid: first_item.mcid,
+                // A consolidated run keeps its script flag only when every
+                // fragment carried the same one; a run spliced from a script
+                // and body text is neither.
+                baseline_shift: if indices
+                    .iter()
+                    .all(|index| items[*index].baseline_shift == first_item.baseline_shift)
+                {
+                    first_item.baseline_shift
+                } else {
+                    0.0
+                },
             });
             index_map.push(indices);
 
@@ -135,17 +204,385 @@ fn expand_consolidated_items(items: &[TextItem]) -> (Vec<TextItem>, Vec<usize>) 
     (expanded, index_map)
 }
 
+#[derive(Clone)]
+struct RedlineEditRegion {
+    x_ranges: Vec<(f32, f32)>,
+    y_min: f32,
+    y_max: f32,
+    spans_page_width: bool,
+}
+
+#[derive(Clone, Copy)]
+struct UnderlinedTableColumn {
+    x_min: f32,
+    x_max: f32,
+}
+
+pub(crate) fn content_width(items: &[TextItem]) -> f32 {
+    let x_min = items
+        .iter()
+        .map(|item| item.x)
+        .fold(f32::INFINITY, f32::min);
+    let x_max = items
+        .iter()
+        .map(|item| item.x + item.width)
+        .fold(f32::NEG_INFINITY, f32::max);
+    (x_max - x_min).max(1.0)
+}
+
+/// Spatial regions where multiple strikeout rows indicate a redline edit block.
+///
+/// A lone deletion can occur inside or beside a real table, so it must not
+/// globally suppress underlined table cells. Closely spaced strikeout rows are
+/// different: together with nearby underlines they form the overlapping
+/// old/new text layers used by legislative redlines, and those decorations
+/// must not become heuristic column evidence.
+fn redline_edit_regions(items: &[TextItem], page_width: f32) -> Vec<RedlineEditRegion> {
+    const ROW_DEDUP_TOLERANCE: f32 = 8.0;
+    const MAX_CLUSTER_GAP: f32 = 64.0;
+    const Y_PADDING: f32 = 36.0;
+    const X_PADDING: f32 = 12.0;
+    const PAGE_WIDTH_RATIO: f32 = 0.35;
+    const MAX_HORIZONTAL_GAP_RATIO: f32 = 0.20;
+
+    let mut strikeouts: Vec<&TextItem> = items.iter().filter(|item| item.is_strikeout).collect();
+    strikeouts.sort_by(|a, b| a.y.total_cmp(&b.y));
+
+    let mut rows: Vec<(f32, Vec<(f32, f32)>)> = Vec::new();
+    for item in strikeouts {
+        if let Some((_, x_ranges)) = rows
+            .last_mut()
+            .filter(|(y, _)| (item.y - *y).abs() <= ROW_DEDUP_TOLERANCE)
+        {
+            x_ranges.push((item.x, item.x + item.width));
+        } else {
+            rows.push((item.y, vec![(item.x, item.x + item.width)]));
+        }
+    }
+
+    let mut regions = Vec::new();
+    let mut start = 0;
+    while start < rows.len() {
+        let mut end = start + 1;
+        while end < rows.len() && rows[end].0 - rows[end - 1].0 <= MAX_CLUSTER_GAP {
+            end += 1;
+        }
+        if end - start >= 2 {
+            let mut x_ranges: Vec<(f32, f32)> = rows[start..end]
+                .iter()
+                .flat_map(|(_, x_ranges)| x_ranges.iter().copied())
+                .collect();
+            x_ranges.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let mut merged_ranges: Vec<(f32, f32)> = Vec::new();
+            for (x_min, x_max) in x_ranges {
+                // Modest inline gaps can separate fragments of one flowing
+                // edit; column-scale gaps must remain distinct spatial masks.
+                if let Some((_, merged_max)) = merged_ranges.last_mut().filter(|(_, merged_max)| {
+                    x_min - *merged_max <= page_width * MAX_HORIZONTAL_GAP_RATIO
+                }) {
+                    *merged_max = merged_max.max(x_max);
+                } else {
+                    merged_ranges.push((x_min, x_max));
+                }
+            }
+            let covered_width: f32 = merged_ranges
+                .iter()
+                .map(|(x_min, x_max)| x_max - x_min)
+                .sum();
+            for (x_min, x_max) in &mut merged_ranges {
+                *x_min -= X_PADDING;
+                *x_max += X_PADDING;
+            }
+            // Redlines spread across much of the text width are flowing prose,
+            // so their whole Y-band is ambiguous. Compact edits can be scoped
+            // to their actual horizontal spans without hiding content between
+            // unrelated edits in separate columns.
+            regions.push(RedlineEditRegion {
+                x_ranges: merged_ranges,
+                y_min: rows[start].0 - Y_PADDING,
+                y_max: rows[end - 1].0 + Y_PADDING,
+                spans_page_width: covered_width >= page_width * PAGE_WIDTH_RATIO,
+            });
+        }
+        start = end;
+    }
+    // Padding can make neighboring clusters overlap. Partition that overlap at
+    // its midpoint so each Y position maps to one region without combining
+    // horizontally unrelated edits.
+    for index in 1..regions.len() {
+        let (previous, current) = regions.split_at_mut(index);
+        let previous = &mut previous[index - 1];
+        let current = &mut current[0];
+        if previous.y_max >= current.y_min {
+            let boundary = (previous.y_max + current.y_min) / 2.0;
+            previous.y_max = boundary;
+            current.y_min = boundary;
+        }
+    }
+    regions
+}
+
+fn overlaps_redline_x(item: &TextItem, region: &RedlineEditRegion) -> bool {
+    let range_index = region
+        .x_ranges
+        .partition_point(|(_, x_max)| *x_max < item.x);
+    region
+        .x_ranges
+        .get(range_index)
+        .is_some_and(|(x_min, _)| item.x + item.width >= *x_min)
+}
+
+fn has_distinct_rows(
+    items: &[&TextItem],
+    underlined_only: bool,
+    required: usize,
+    tolerance: f32,
+) -> bool {
+    debug_assert!(required <= 3);
+    let mut rows = [0.0; 3];
+    let mut row_count = 0;
+    for item in items {
+        if underlined_only && !item.is_underline {
+            continue;
+        }
+        if rows[..row_count]
+            .iter()
+            .all(|row| (item.y - row).abs() > tolerance)
+        {
+            rows[row_count] = item.y;
+            row_count += 1;
+            if row_count == required {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Aligned live items seeded by underline evidence form revised table columns.
+/// Compact edits accept one replacement backed by surrounding live rows; wide
+/// prose-like edits require replacements on at least two distinct rows.
+fn underlined_table_columns(
+    items: &[TextItem],
+    redline_regions: &[RedlineEditRegion],
+) -> Vec<Vec<UnderlinedTableColumn>> {
+    const X_ALIGNMENT_TOLERANCE: f32 = 4.0;
+    const ROW_DEDUP_TOLERANCE: f32 = 8.0;
+
+    // Sort once globally by X, then partition candidates into their unique Y
+    // regions. Each regional vector remains X-sorted without another sort.
+    let mut live_items: Vec<&TextItem> = items.iter().filter(|item| !item.is_strikeout).collect();
+    live_items.sort_by(|a, b| a.x.total_cmp(&b.x));
+    let mut candidates_by_region: Vec<Vec<&TextItem>> = vec![Vec::new(); redline_regions.len()];
+    for item in live_items {
+        if let Some(region_index) = redline_region_at_y(redline_regions, item.y) {
+            if overlaps_redline_x(item, &redline_regions[region_index]) {
+                candidates_by_region[region_index].push(item);
+            }
+        }
+    }
+
+    let mut columns_by_region = Vec::with_capacity(redline_regions.len());
+    for (region, candidates) in redline_regions.iter().zip(candidates_by_region) {
+        let mut columns: Vec<UnderlinedTableColumn> = Vec::new();
+        let mut start = 0;
+        while start < candidates.len() {
+            let mut end = start + 1;
+            while end < candidates.len()
+                && candidates[end].x - candidates[start].x <= X_ALIGNMENT_TOLERANCE
+            {
+                end += 1;
+            }
+            let aligned_items = &candidates[start..end];
+            let enough_live_rows = has_distinct_rows(aligned_items, false, 3, ROW_DEDUP_TOLERANCE);
+            let required_underlined_rows = if region.spans_page_width { 2 } else { 1 };
+            let enough_underlined_rows = has_distinct_rows(
+                aligned_items,
+                true,
+                required_underlined_rows,
+                ROW_DEDUP_TOLERANCE,
+            );
+            if enough_live_rows && enough_underlined_rows {
+                let x_min = candidates[start].x - X_ALIGNMENT_TOLERANCE;
+                let x_max = candidates[end - 1].x + X_ALIGNMENT_TOLERANCE;
+                if let Some(column) = columns.last_mut().filter(|column| column.x_max >= x_min) {
+                    column.x_max = column.x_max.max(x_max);
+                } else {
+                    columns.push(UnderlinedTableColumn { x_min, x_max });
+                }
+            }
+            start = end;
+        }
+        columns_by_region.push(columns);
+    }
+    columns_by_region
+}
+
+fn redline_region_at_y(redline_regions: &[RedlineEditRegion], y: f32) -> Option<usize> {
+    let region_index = redline_regions.partition_point(|region| region.y_max < y);
+    redline_regions
+        .get(region_index)
+        .filter(|region| y >= region.y_min)
+        .map(|_| region_index)
+}
+
+fn is_heuristic_table_evidence(
+    item: &TextItem,
+    redline_regions: &[RedlineEditRegion],
+    underlined_table_columns: &[Vec<UnderlinedTableColumn>],
+) -> bool {
+    if item.is_strikeout {
+        return false;
+    }
+
+    let Some(region_index) = redline_region_at_y(redline_regions, item.y) else {
+        return true;
+    };
+    let region = &redline_regions[region_index];
+    let columns = &underlined_table_columns[region_index];
+    if region.spans_page_width && columns.is_empty() {
+        return false;
+    }
+
+    let overlaps_x = overlaps_redline_x(item, region);
+    !overlaps_x || is_revised_table_cell(item, columns)
+}
+
+fn is_revised_table_cell(
+    item: &TextItem,
+    underlined_table_columns: &[UnderlinedTableColumn],
+) -> bool {
+    let column_index = underlined_table_columns.partition_point(|column| column.x_max < item.x);
+    underlined_table_columns
+        .get(column_index)
+        .is_some_and(|column| item.x >= column.x_min)
+}
+
+fn revised_table_cell_indices(
+    items: &[TextItem],
+    redline_regions: &[RedlineEditRegion],
+    underlined_table_columns: &[Vec<UnderlinedTableColumn>],
+) -> std::collections::HashSet<usize> {
+    items
+        .iter()
+        .enumerate()
+        .filter_map(|(item_index, item)| {
+            let region_index = redline_region_at_y(redline_regions, item.y)?;
+            let region = &redline_regions[region_index];
+            (item.is_underline
+                && overlaps_redline_x(item, region)
+                && is_revised_table_cell(item, &underlined_table_columns[region_index]))
+            .then_some(item_index)
+        })
+        .collect()
+}
+
+/// Index of candidate "body" items (larger-font attachment targets) sorted by
+/// Y, so script-attachment checks scan a narrow Y window instead of the whole
+/// page per candidate.
+struct ScriptBodyIndex<'a> {
+    /// (y, item), sorted ascending by y
+    by_y: Vec<(f32, &'a TextItem)>,
+    /// widest vertical attachment window any body item can produce
+    max_window: f32,
+}
+
+impl<'a> ScriptBodyIndex<'a> {
+    fn new(items: &'a [TextItem]) -> Self {
+        // Smallest table-candidate font is 6pt, so any possible attachment
+        // target is at least 6 x 1.2 pt.
+        let mut by_y: Vec<(f32, &TextItem)> = items
+            .iter()
+            .filter(|i| i.font_size >= 6.0 * 1.2)
+            .map(|i| (i.y, i))
+            .collect();
+        by_y.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let max_window = by_y
+            .iter()
+            .map(|(_, i)| i.font_size * 0.8)
+            .fold(0.0f32, f32::max);
+        Self { by_y, max_window }
+    }
+
+    /// True when a small-font item is horizontally attached to a larger-font
+    /// item at a script baseline offset — a sub/superscript in running text
+    /// or math (equation subscripts, footnote markers). Script attachments
+    /// are not table cells; without this filter, display equations with
+    /// sub/superscripts form phantom small-font table regions (e.g. TeX
+    /// papers where log subscripts cluster with footnote lines into a fake
+    /// 3-column table). A genuine baseline offset is required so same-line
+    /// table neighbours (a small cell beside a larger label cell) are never
+    /// classified as scripts.
+    ///
+    /// `min_anchor_size` additionally constrains what counts as an
+    /// attachment target: the small-font pass accepts any sufficiently
+    /// larger item (0.0), while the body-font pass requires a heading-sized
+    /// anchor so a body-size table cell beside a slightly larger label with
+    /// baseline jitter is never treated as a script.
+    fn is_script_attachment(&self, small: &TextItem, min_anchor_size: f32) -> bool {
+        let attach_gap = small.font_size.max(4.0) * 0.6;
+        let lo = self
+            .by_y
+            .partition_point(|(y, _)| *y < small.y - self.max_window);
+        self.by_y[lo..]
+            .iter()
+            .take_while(|(y, _)| *y <= small.y + self.max_window)
+            .any(|(_, body)| {
+                let dy = (small.y - body.y).abs();
+                body.font_size >= small.font_size * 1.2
+                    && body.font_size >= min_anchor_size
+                    && dy > body.font_size * 0.05
+                    && dy <= body.font_size * 0.8
+                    && {
+                        let gap_after_body = small.x - (body.x + body.width);
+                        let gap_before_body = body.x - (small.x + small.width);
+                        (-attach_gap..=attach_gap).contains(&gap_after_body)
+                            || (-attach_gap..=attach_gap).contains(&gap_before_body)
+                    }
+            })
+    }
+}
+
 /// Detect tables in a set of text items from a single page
 pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bool) -> Vec<Table> {
+    detect_tables_with_page_width(items, base_font_size, skip_body_font, content_width(items))
+}
+
+/// Detect tables in a subset while using the full page's text width for
+/// page-spanning redline classification.
+pub(crate) fn detect_tables_with_page_width(
+    items: &[TextItem],
+    base_font_size: f32,
+    skip_body_font: bool,
+    page_width: f32,
+) -> Vec<Table> {
     if items.len() < 6 {
         return vec![];
     }
+    // Compute these before consolidation: adjacent old/new text can merge and
+    // inherit only the first fragment's decoration flags.
+    let redline_regions = redline_edit_regions(items, page_width);
+    let underlined_table_columns = underlined_table_columns(items, &redline_regions);
+    let source_evidence: Vec<bool> = items
+        .iter()
+        .map(|item| is_heuristic_table_evidence(item, &redline_regions, &underlined_table_columns))
+        .collect();
+    let revised_table_cells =
+        revised_table_cell_indices(items, &redline_regions, &underlined_table_columns);
 
     // Step 1: Merge adjacent single-char items into words (handles per-character PDFs)
-    let (merged_items, merge_map) = merge_adjacent_items(items);
+    let (merged_items, merge_map) = merge_adjacent_items_preserving(items, &revised_table_cells);
 
     // Step 2: Expand consolidated financial items (e.g. "$ 1,234 $ 5,678" → sub-items)
     let (expanded_items, expand_map) = expand_consolidated_items(&merged_items);
+    let expanded_evidence: Vec<bool> = expand_map
+        .iter()
+        .map(|&merged_index| {
+            merge_map[merged_index]
+                .iter()
+                .all(|&source_index| source_evidence[source_index])
+        })
+        .collect();
     let items = &expanded_items[..]; // shadow parameter — all detection uses processed items
 
     let mut tables = Vec::new();
@@ -154,14 +591,46 @@ pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bo
     // === Pass 1: Small-font tables (existing behavior) ===
     let table_font_threshold = base_font_size * 0.90;
 
+    // Mark sub/superscript attachments once per pass. They stay candidates —
+    // the masks only remove them from region qualification and column/row
+    // geometry.
+    //
+    // The two passes need different anchor thresholds. In the small-font pass
+    // any sufficiently larger neighbour is a plausible base for a script. In
+    // the body-font pass the candidates are themselves body-sized
+    // (0.85..1.05x), so a merely "slightly larger" neighbour is usually a bold
+    // label or an adjacent column header, not the base of a superscript —
+    // treating it as one would strip real cells out of the geometry and lose
+    // the table. Requiring a heading-sized anchor (>= 1.15x base) keeps the
+    // body pass to genuine scripts hanging off headings.
+    let script_index = ScriptBodyIndex::new(items);
+    let script_flags: Vec<bool> = items
+        .iter()
+        .map(|item| script_index.is_script_attachment(item, 0.0))
+        .collect();
+    let body_script_flags: Vec<bool> = items
+        .iter()
+        .map(|item| script_index.is_script_attachment(item, base_font_size * 1.15))
+        .collect();
     let table_candidates: Vec<(usize, &TextItem)> = items
         .iter()
         .enumerate()
-        .filter(|(_, item)| item.font_size <= table_font_threshold && item.font_size >= 6.0)
+        .filter(|(index, item)| {
+            expanded_evidence[*index]
+                && item.font_size <= table_font_threshold
+                && item.font_size >= 6.0
+        })
         .collect();
 
     if table_candidates.len() >= 6 {
-        let regions = find_table_regions(&table_candidates);
+        // Qualify regions from non-script items: a cluster of sub/superscripts
+        // must not, on its own, mark out a table region.
+        let region_evidence: Vec<(usize, &TextItem)> = table_candidates
+            .iter()
+            .filter(|(idx, _)| !script_flags[*idx])
+            .cloned()
+            .collect();
+        let regions = find_table_regions(&region_evidence);
 
         for (y_min, y_max) in regions {
             let region_items: Vec<(usize, &TextItem)> = table_candidates
@@ -175,7 +644,9 @@ pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bo
             }
 
             if let Some(mut table) =
-                detect_table_in_region(&region_items, TableDetectionMode::SmallFont)
+                detect_table_in_region(&region_items, TableDetectionMode::SmallFont, &|i| {
+                    script_flags[i]
+                })
             {
                 // Try to recover body-font header row above the small-font table
                 recover_header_row(&mut table, items, table_font_threshold);
@@ -206,6 +677,7 @@ pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bo
             .enumerate()
             .filter(|(idx, item)| {
                 !claimed_indices.contains(idx)
+                    && expanded_evidence[*idx]
                     && item.font_size >= body_font_low
                     && item.font_size <= body_font_high
                     && item.font_size >= 6.0
@@ -219,8 +691,20 @@ pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bo
             body_font_low,
             body_font_high,
         );
+        // Scripts are NOT filtered out of the candidate set here, mirroring
+        // the small-font pass: they must stay eligible for cell assignment so
+        // a sub/superscript that belongs inside a table cell keeps its text.
+        // The heading-anchored `body_script_flags` mask removes them from
+        // geometry only.
         if body_candidates.len() >= 6 {
-            let regions = find_table_regions_strict(&body_candidates);
+            // Same reasoning as the small-font pass: scripts do not qualify
+            // regions, but remain available for cell assignment within one.
+            let region_evidence: Vec<(usize, &TextItem)> = body_candidates
+                .iter()
+                .filter(|(idx, _)| !body_script_flags[*idx])
+                .cloned()
+                .collect();
+            let regions = find_table_regions_strict(&region_evidence);
             log::debug!("body-font: {} strict regions found", regions.len());
 
             for (y_min, y_max, _x_min, _x_max) in &regions {
@@ -246,7 +730,9 @@ pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bo
                 }
 
                 if let Some(table) =
-                    detect_table_in_region(&region_items, TableDetectionMode::BodyFont)
+                    detect_table_in_region(&region_items, TableDetectionMode::BodyFont, &|i| {
+                        body_script_flags[i]
+                    })
                 {
                     tables.push(table);
                 }
@@ -474,10 +960,389 @@ fn find_table_regions_strict(items: &[(usize, &TextItem)]) -> Vec<(f32, f32, f32
     regions
 }
 
-/// Detect a table within a specific region
-fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode) -> Option<Table> {
-    // Find column boundaries
-    let columns = find_column_boundaries(items, mode);
+/// Detect a table within a specific region.
+///
+/// `is_script` marks items that are sub/superscript attachments. Those are
+/// excluded from the *geometry* — they must not be able to create a column,
+/// which is how equation subscript clusters used to fabricate phantom grids —
+/// but they remain eligible for cell assignment, so legitimate cell content
+/// (exponents in an engineering-notation table, footnote markers) stays in
+/// the cell it belongs to instead of leaking out into the reading order.
+/// A contents list without dot leaders: rows whose rightmost item is a
+/// page number (arabic or roman) sitting on one right edge, possibly with
+/// rows that carry no number between them — the authors under a chapter
+/// entry, a part title. Such a page has most of its items in the title
+/// column, which the generic column finder rejects as paragraph text, so the
+/// list is built here as a two-column table and classified by the same rules
+/// as every other contents table (`is_table_of_contents`); anything that
+/// fails them falls through to the generic path.
+/// Characters that draw a contents leader: full stops, the one-dot leader,
+/// the middle dot Japanese documents use, and the ellipsis.
+fn is_leader_char(c: char) -> bool {
+    matches!(c, '.' | '\u{2024}' | '\u{00B7}' | '\u{2026}' | ' ')
+}
+
+/// Drops a trailing leader run — three or more dots, or an ellipsis — and
+/// keeps the full stop that ends a title of its own.
+fn strip_leader(title: &str) -> &str {
+    let kept = title.trim_end_matches(is_leader_char);
+    let run = &title[kept.len()..];
+    let dots =
+        run.chars().filter(|c| !c.is_whitespace()).count() + 2 * run.matches('\u{2026}').count();
+    if dots >= 3 {
+        kept.trim_end()
+    } else {
+        title.trim_end()
+    }
+}
+
+/// The entry's page number is the row's rightmost text item; a script after
+/// it (a footnote marker) belongs to the entry, not to the page number.
+fn page_item(row: &[(usize, &TextItem)]) -> Option<usize> {
+    row.iter().rposition(|(_, i)| !i.is_script())
+}
+
+fn detect_contents_list(items: &[(usize, &TextItem)]) -> Option<Table> {
+    let rows = find_row_boundaries(items);
+    if rows.len() < 4 {
+        return None;
+    }
+    let mut row_items: Vec<Vec<(usize, &TextItem)>> = vec![Vec::new(); rows.len()];
+    for &(idx, item) in items {
+        if let Some(row) = find_row_index(&rows, item.line_y()) {
+            row_items[row].push((idx, item));
+        }
+    }
+    for row in &mut row_items {
+        row.sort_by(|a, b| a.1.x.total_cmp(&b.1.x));
+    }
+    // A numbered row ends in a page number and has a text title before it —
+    // one contiguous title, at most preceded by a short chapter or section
+    // number. A row whose title is broken by column-sized gaps is a data row
+    // whose last cell happens to be a small number (a feature matrix's "x"
+    // marks read as roman ten, a course table's credits), not an entry.
+    let numbered: Vec<Option<f32>> = row_items
+        .iter()
+        .map(|row| {
+            // The page number is the row's last item — rightmost by its right edge,
+            // starting after every other item ends — set in roughly the entry's
+            // size and never a script. A footnote marker raised off the line
+            // below, small and at the left margin, is none of those.
+            let page_at = page_item(row)?;
+            let (_, last) = &row[page_at];
+            // Everything else is the title — scripts included, so a footnote
+            // marker after the page number stays with its entry — but only
+            // the text items shape it.
+            let title: Vec<(usize, &TextItem)> = row
+                .iter()
+                .enumerate()
+                .filter(|(k, _)| *k != page_at)
+                .map(|(_, it)| *it)
+                .collect();
+            let text_items: Vec<(usize, &TextItem)> = title
+                .iter()
+                .filter(|(_, i)| !i.is_script())
+                .copied()
+                .collect();
+            let title_end = text_items
+                .iter()
+                .map(|(_, i)| i.x + i.width)
+                .fold(f32::NEG_INFINITY, f32::max);
+            if last.x < title_end - 1.0 {
+                return None;
+            }
+            let mut sizes: Vec<f32> = text_items.iter().map(|(_, i)| i.font_size).collect();
+            sizes.sort_by(|a, b| a.total_cmp(b));
+            if let Some(&median) = sizes.get(sizes.len() / 2) {
+                if last.font_size < median * 0.75 {
+                    return None;
+                }
+            }
+            page_number_value(last.text.trim())?;
+            // An entry's title is text: more letters than digits once its
+            // leading section number ("4.3.3.4", "2.") is set aside. A data
+            // row of a statistical table ("2023: Jan ...... 6,202 2,328 …")
+            // ending in a small number is digits through and through.
+            let text = text_items
+                .iter()
+                .map(|(_, i)| i.text.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let is_section_number = |token: &str| {
+                token.len() <= 10
+                    && token.chars().any(|c| c.is_ascii_digit())
+                    && token
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || matches!(c, '.' | ':' | ')' | '('))
+                    && token
+                        .split(|c: char| !c.is_ascii_digit())
+                        .all(|group| group.len() <= 3)
+            };
+            let body = match text.split_once(char::is_whitespace) {
+                // A section number is digit groups of at most three digits
+                // with dots or a list suffix ("4.3.3.4", "2.", "1)"); a year
+                // ("2023:") is a four-digit group and stays in the count.
+                Some((first, rest)) if is_section_number(first) => rest,
+                _ => text.as_str(),
+            };
+            let (letters, digits) = body.chars().fold((0usize, 0usize), |(l, d), c| {
+                (
+                    l + c.is_alphabetic() as usize,
+                    d + c.is_ascii_digit() as usize,
+                )
+            });
+            let has_title = letters > digits;
+            let breaks: Vec<usize> = text_items
+                .windows(2)
+                .enumerate()
+                .filter(|(_, pair)| pair[1].1.x - (pair[0].1.x + pair[0].1.width) > 20.0)
+                .map(|(i, _)| i)
+                .collect();
+            let compact = breaks.is_empty()
+                || (breaks == [0] && text_items[0].1.text.trim().chars().count() <= 6);
+            (has_title && compact).then_some(last.x + last.width)
+        })
+        .collect();
+    // Entries that start with a year ("2020: Q1 revenue") are the rows of a
+    // period table whose last column happens to climb, not a contents list.
+    let year_led = row_items
+        .iter()
+        .zip(&numbered)
+        .filter(|(row, n)| {
+            n.is_some()
+                && row.first().is_some_and(|(_, i)| {
+                    let digits: String = i
+                        .text
+                        .trim()
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect();
+                    digits.len() == 4 && digits.starts_with(['1', '2'])
+                })
+        })
+        .count();
+    // Two contents columns side by side put a second entry after the first
+    // one's page number on the same row ("The MTU Group 47 Glossary 347"):
+    // an interior bare number followed by a capitalised word, in rows whose
+    // interior numbers climb down the page. That is not one list; the
+    // generic path keeps rendering it as it did.
+    let interior_numbers: Vec<u32> = row_items
+        .iter()
+        .filter_map(|row| {
+            let text = row
+                .iter()
+                .map(|(_, i)| i.text.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let tokens: Vec<&str> = text.split_whitespace().collect();
+            tokens.windows(2).skip(1).find_map(|pair| {
+                let value = pair[0]
+                    .chars()
+                    .all(|c| c.is_ascii_digit())
+                    .then(|| page_number_value(pair[0]))
+                    .flatten()?;
+                pair[1]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_uppercase())
+                    .then_some(value)
+            })
+        })
+        .collect();
+    // The number sits inside the title's own text item on such a page, so
+    // there is no item boundary to measure; the sequence tells instead. A
+    // chapter label ("Chapter 1 Introduction", "Chapter 2 …") climbs by
+    // exactly one down the page, a second column's page numbers do not.
+    let chapter_labels = interior_numbers.windows(2).all(|w| w[1] == w[0] + 1);
+    if interior_numbers.len() >= 3
+        && !chapter_labels
+        && interior_numbers.windows(2).all(|w| w[1] >= w[0])
+    {
+        debug!(
+            "  contents list rejected: {} rows hold a second column's entry",
+            interior_numbers.len()
+        );
+        return None;
+    }
+    let mut right_edges: Vec<f32> = numbered.iter().flatten().copied().collect();
+    if year_led * 2 > right_edges.len() {
+        debug!(
+            "  contents list rejected: {} of {} entries start with a year",
+            year_led,
+            right_edges.len()
+        );
+        return None;
+    }
+    // Leading and trailing rows without a number are not part of the list;
+    // within it, entries must make up a fair share of the rows — a contents
+    // page with the authors under every entry and part titles between the
+    // chapters is still well over a third entries, a page of prose with a
+    // few numbered lines is not.
+    let first = numbered.iter().position(Option::is_some)?;
+    let last = numbered.iter().rposition(Option::is_some)?;
+    let span_rows = last - first + 1;
+    if right_edges.len() < 4 || right_edges.len() * 5 < span_rows * 2 {
+        debug!(
+            "  contents list rejected: {} numbered rows of {}",
+            right_edges.len(),
+            span_rows
+        );
+        return None;
+    }
+    // A contents list runs through the document: its page numbers take at
+    // least three distinct values and end higher than they start. A table
+    // header whose rows all end in the same small number ("20 years and
+    // over" columns) or a rank column counting back down does neither.
+    let mut values: Vec<u32> = row_items
+        .iter()
+        .zip(&numbered)
+        .filter(|(_, n)| n.is_some())
+        .filter_map(|(row, _)| page_number_value(row[page_item(row)?].1.text.trim()))
+        .collect();
+    let (first_value, last_value) = (*values.first()?, *values.last()?);
+    let raw_values = values.clone();
+    values.sort_unstable();
+    values.dedup();
+    if values.len() < 3 || last_value <= first_value {
+        debug!(
+            "  contents list rejected: page values {:?} do not run through a document",
+            values
+        );
+        return None;
+    }
+    // The page numbers share a right edge.
+    right_edges.sort_by(|a, b| a.total_cmp(b));
+    let median_edge = right_edges[right_edges.len() / 2];
+    let aligned = right_edges
+        .iter()
+        .filter(|&&e| (e - median_edge).abs() <= 8.0)
+        .count();
+    if aligned * 5 < right_edges.len() * 4 {
+        debug!(
+            "  contents list rejected: {} of {} page numbers on the shared edge",
+            aligned,
+            right_edges.len()
+        );
+        return None;
+    }
+    // A rank or ID column is a perfectly dense run (1, 2, 3, …); a contents
+    // page can be one too when every entry has its own page. The generic
+    // path tells them apart by the header row a data table carries above its
+    // numbers, and that row is what the block boundary above drops — so a
+    // dense run whose preceding row holds a text item over the number
+    // column is the data table it looks like, and stays with the generic
+    // path. A script there (a footnote marker on the title above) is not a
+    // header.
+    let dense_consecutive = {
+        let mut sorted = raw_values.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        sorted.len() == raw_values.len()
+            && sorted
+                .last()
+                .is_some_and(|max| (max - sorted[0]) as usize + 1 == sorted.len())
+    };
+    if dense_consecutive && first > 0 {
+        let number_left = row_items[first..=last]
+            .iter()
+            .zip(&numbered[first..=last])
+            .filter(|(_, n)| n.is_some())
+            .filter_map(|(row, _)| page_item(row).map(|at| row[at].1.x))
+            .fold(f32::INFINITY, f32::min);
+        let header_over_numbers = row_items[first - 1].iter().any(|(_, i)| {
+            !i.is_script() && i.x <= median_edge + 2.0 && i.x + i.width >= number_left - 2.0
+        });
+        if header_over_numbers {
+            debug!(
+                "  contents list rejected: dense run {:?} under a header row",
+                raw_values
+            );
+            return None;
+        }
+    }
+
+    let mut cells = Vec::new();
+    let mut item_indices = Vec::new();
+    let mut title_x = f32::INFINITY;
+    let mut number_x = Vec::new();
+    for (row, is_numbered) in row_items[first..=last].iter().zip(&numbered[first..=last]) {
+        // The shared edge was judged for the block as a whole; a row whose
+        // number sits a little off it is still an entry and keeps its tab.
+        let (title_items, page) = match is_numbered {
+            Some(_) => {
+                let page_at = page_item(row)?;
+                let (_, number) = row[page_at];
+                number_x.push(number.x);
+                let title_items: Vec<(usize, &TextItem)> = row
+                    .iter()
+                    .enumerate()
+                    .filter(|(k, _)| *k != page_at)
+                    .map(|(_, it)| *it)
+                    .collect();
+                (title_items, number.text.trim().to_string())
+            }
+            None => (row.to_vec(), String::new()),
+        };
+        // Leader dots between a title and its page number are the leader,
+        // not the title — `format_toc_as_list` drops dots-only cells, and a
+        // trailing run of leader characters on the title is dropped here for
+        // the same reason, so a leadered contents page renders as it always
+        // did.
+        let joined = title_items
+            .iter()
+            .map(|(_, i)| i.text.trim())
+            .filter(|t| !t.is_empty() && !t.chars().all(is_leader_char))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let title = strip_leader(&joined).to_string();
+        if let Some((_, i)) = title_items.first() {
+            title_x = title_x.min(i.x);
+        }
+        item_indices.extend(row.iter().map(|(idx, _)| *idx));
+        cells.push(vec![title, page]);
+    }
+    number_x.sort_by(|a, b| a.total_cmp(b));
+    let columns = vec![title_x, number_x[number_x.len() / 2]];
+    let table = Table::new(columns, rows[first..=last].to_vec(), cells, item_indices);
+    if table.kind != super::TableKind::Toc {
+        debug!(
+            "  contents list rejected: {} rows do not classify as a contents table",
+            table.rows.len()
+        );
+        return None;
+    }
+    debug!(
+        "contents list detected: {} rows, {} numbered",
+        table.rows.len(),
+        right_edges.len()
+    );
+    Some(table)
+}
+
+fn detect_table_in_region(
+    items: &[(usize, &TextItem)],
+    mode: TableDetectionMode,
+    is_script: &dyn Fn(usize) -> bool,
+) -> Option<Table> {
+    // Column geometry from non-script items only.
+    let geometry_items: Vec<(usize, &TextItem)> = items
+        .iter()
+        .filter(|(idx, _)| !is_script(*idx))
+        .cloned()
+        .collect();
+    // A region that is *entirely* scripts has no table structure at all.
+    if geometry_items.is_empty() {
+        return None;
+    }
+    // A contents list — entries ending in right-aligned page numbers, with
+    // author or part-title rows between them — is left-heavy by nature and
+    // would be thrown out below as a paragraph. It has its own shape.
+    // Every item takes part, scripts included: a footnote marker on an
+    // entry belongs to that entry's title, not to the text flow.
+    if let Some(table) = detect_contents_list(items) {
+        return Some(table);
+    }
+    let columns = find_column_boundaries(&geometry_items, mode);
     let min_cols = 2;
     if columns.len() < min_cols || columns.len() > 25 {
         log::debug!(
@@ -488,8 +1353,8 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
         return None;
     }
 
-    // Find row boundaries
-    let rows = find_row_boundaries(items);
+    // Find row boundaries (geometry items only, same reasoning)
+    let rows = find_row_boundaries(&geometry_items);
     let min_rows = 2;
     if rows.len() < min_rows {
         log::debug!(
@@ -508,6 +1373,11 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
     );
 
     // Verify this looks like a table: multiple items should align to columns
+    // Validate against ALL items, including scripts. Columns are derived from
+    // non-script geometry so scripts cannot *create* a column, but excluding
+    // them from validation too would let a region manufacture alignment: drop
+    // the awkward items and whatever remains looks like a tidy grid. Block
+    // diagrams did exactly that. Everything in the region must fit.
     let col_alignment = check_column_alignment(items, &columns, mode);
     let min_alignment = match mode {
         TableDetectionMode::SmallFont => 0.5,
@@ -531,7 +1401,10 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
 
     for (idx, item) in items {
         let col = find_column_index(&columns, item.x);
-        let row = find_row_index(&rows, item.y);
+        let row = find_row_index(&rows, item.line_y());
+        if super::crosses_other_rows(item, &rows, row) {
+            continue;
+        }
 
         if let (Some(col), Some(row)) = (col, row) {
             cell_items[row][col].push(item);
@@ -563,10 +1436,14 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
     for row_items in &mut cell_items {
         let mut row_cells = Vec::with_capacity(columns.len());
         for col_items in row_items.iter_mut() {
-            // Sort by X position (direction-aware)
-            let rtl = is_rtl_text(col_items.iter().map(|i| &i.text));
+            // Sort by X position (direction-aware). RTL direction comes from
+            // strong RTL letters only — a digit-only cell split across items
+            // must not have its number reversed. RTL cells sort in baseline
+            // bands so wrapped lines stay contiguous for the embedded-LTR
+            // restoration (matching the rect and structure-tree detectors).
+            let rtl = crate::text_utils::is_rtl_text(col_items.iter().map(|i| &i.text));
             if rtl {
-                col_items.sort_by(|a, b| b.x.total_cmp(&a.x));
+                crate::text_utils::sort_rtl_cell_items(col_items, |i| *i);
             } else {
                 col_items.sort_by(|a, b| a.x.total_cmp(&b.x));
             }
@@ -576,6 +1453,29 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
             row_cells.push(text);
         }
         cells.push(row_cells);
+    }
+
+    // Validation 0 (small-font pass only): reject tiny all-numeric
+    // fragments. A <=2-row grid whose every cell is a bare 1-2 digit number
+    // carries no tabular information — in practice these are
+    // exponent/subscript clusters from display math that happen to align.
+    // Body-font tables are not subject to this veto: their cells cannot be
+    // script glyphs.
+    if matches!(mode, TableDetectionMode::SmallFont) {
+        let nonempty_cells: Vec<&String> =
+            cells.iter().flatten().filter(|c| !c.is_empty()).collect();
+        if rows.len() <= 2
+            && !nonempty_cells.is_empty()
+            && nonempty_cells
+                .iter()
+                .all(|c| c.len() <= 2 && c.chars().all(|ch| ch.is_ascii_digit()))
+        {
+            log::debug!(
+                "  validation 0 fail: tiny all-numeric fragment ({} cells)",
+                nonempty_cells.len()
+            );
+            return None;
+        }
     }
 
     // Validation 1: some rows should have content in first column.
@@ -912,7 +1812,204 @@ fn looks_like_number(s: &str) -> bool {
 ///
 /// Used by format.rs to render TOCs as flat lists instead of markdown tables.
 pub fn is_table_of_contents(cells: &[Vec<String>]) -> bool {
-    is_dot_leader_toc(cells) || is_tabular_toc(cells)
+    is_dot_leader_toc(cells) || is_tabular_toc(cells) || is_page_number_toc(cells)
+}
+
+/// Parse a page-number-like token: a short arabic integer (≤4 digits) or a
+/// canonical roman numeral (front-matter pages: i, ii, …, xxxviii). Roman
+/// parsing is shared with the formatter via `super::canonical_roman_value` so
+/// the two stay in sync.
+fn page_number_value(token: &str) -> Option<u32> {
+    let t = token.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if t.chars().all(|c| c.is_ascii_digit()) && t.len() <= 4 {
+        return t.parse().ok();
+    }
+    super::canonical_roman_value(t)
+}
+
+/// Page-number-column TOC: title-based contents with no dot leaders and no
+/// section numbers (e.g. "About the Publisher  vii", "Experiment #1 …  3").
+/// The signature is a text-title first column and a last column that is almost
+/// entirely page numbers whose values are *mostly non-decreasing* — the
+/// monotonic run is what separates a real TOC from an incidental 2-column
+/// numeric data table.
+pub(super) fn is_page_number_toc(cells: &[Vec<String>]) -> bool {
+    let num_cols = cells.first().map(|r| r.len()).unwrap_or(0);
+    // A page-number TOC is a narrow list (title + page, optionally a leader
+    // column). Wider grids are data tables, not contents.
+    if !(2..=3).contains(&num_cols) || cells.len() < 2 {
+        return false;
+    }
+    // 3-4 row fragments (a chapter's sections split into their own grid)
+    // carry less evidence than a full contents page, so they must be
+    // perfect: every last-column cell a page number, values strictly
+    // increasing, and every first-column cell a multi-word title.
+    // Leader-dot residue ("..19") only reads as a page number when the
+    // page column itself (or a dedicated dots-only leader cell) shows
+    // leader dots; an ellipsis inside a title is prose, and a leading
+    // period elsewhere is decimal notation that must not be stripped.
+    let page_col = num_cols - 1;
+    let has_leader_dots = cells.iter().any(|row| {
+        let page_cell_leader = row.get(page_col).is_some_and(|c| {
+            let t = c.trim();
+            t.starts_with("..") || t.starts_with('\u{2026}')
+        });
+        let dots_only_cell = row.iter().any(|c| {
+            let t = c.trim();
+            t.len() >= 2 && t.chars().all(|ch| ch == '.' || ch == '\u{2026}')
+        });
+        page_cell_leader || dots_only_cell
+    });
+    fn clean_page_cell(cell: &str, has_leader_dots: bool) -> &str {
+        if has_leader_dots {
+            cell.trim_start_matches(['.', '\u{2026}', ' '])
+        } else {
+            cell.trim()
+        }
+    }
+    if cells.len() < 5 {
+        let last_col = num_cols - 1;
+        let vals: Vec<u32> = cells
+            .iter()
+            .filter_map(|row| {
+                let cell = row.get(last_col).map(String::as_str).unwrap_or("");
+                page_number_value(clean_page_cell(cell, has_leader_dots))
+            })
+            .collect();
+        // A fragment row can lose its title to a neighboring grid; judge
+        // only the titles that are present.
+        let titles: Vec<&str> = cells
+            .iter()
+            .filter_map(|row| row.first())
+            .map(|c| c.trim())
+            .filter(|c| !c.is_empty())
+            .collect();
+        let titles_ok = titles.len() >= 2
+            && titles.iter().all(|c| {
+                c.split_whitespace().count() >= 2 && c.chars().any(|ch| ch.is_alphabetic())
+            });
+        // Short fragments carry little evidence: ascending numbers with
+        // multi-word labels also describe a small data summary. Require a
+        // contents-specific signal — every title carries genuine section
+        // syntax ("Section 6.3", "2.1.4 Methods", "4. A Jewel …") or the
+        // fragment shows leader dots. Years, IDs, and measurements do not
+        // qualify: a bare all-digit token only counts as an ordinal when
+        // it starts the title with a list-marker suffix, and dotted tokens
+        // must be multi-part section numbers with short groups.
+        let section_numbered = |title: &str| {
+            let mut words = title.split_whitespace();
+            let first = words.next().unwrap_or("");
+            let leading_ordinal = first.len() <= 4
+                && first.ends_with(['.', ')'])
+                && !first[..first.len() - 1].is_empty()
+                && first[..first.len() - 1].chars().all(|c| c.is_ascii_digit());
+            let dotted_section = title.split_whitespace().any(|tok| {
+                let tok = tok.trim_end_matches([':', '.']);
+                let groups: Vec<&str> = tok.split('.').collect();
+                groups.len() >= 2
+                    && groups.iter().all(|g| {
+                        !g.is_empty() && g.len() <= 3 && g.chars().all(|c| c.is_ascii_digit())
+                    })
+            });
+            leading_ordinal || dotted_section
+        };
+        if !has_leader_dots && !titles.iter().all(|t| section_numbered(t)) {
+            return false;
+        }
+        return vals.len() == cells.len() && titles_ok && vals.windows(2).all(|w| w[1] > w[0]);
+    }
+    let last = num_cols - 1;
+
+    // No header row: a TOC's first row is already an entry, so its last cell is
+    // a page number. A data table's first row is a column header (non-numeric,
+    // or an empty units cell like "Category | ") — the tell that separates
+    // "Mineral | CEC" tables from real contents. Check the actual first row,
+    // not the first non-empty one, so a blank header cell still rejects.
+    let first_last = cells[0].get(last).map(|s| s.trim()).unwrap_or("");
+    if page_number_value(clean_page_cell(first_last, has_leader_dots)).is_none() {
+        return false;
+    }
+
+    // Last column: page numbers on ≥70% of filled rows; collect their values.
+    let mut filled = 0u32;
+    let mut page_vals: Vec<u32> = Vec::new();
+    for row in cells {
+        let cell = row.get(last).map(|s| s.trim()).unwrap_or("");
+        if cell.is_empty() {
+            continue;
+        }
+        filled += 1;
+        if let Some(v) = page_number_value(clean_page_cell(cell, has_leader_dots)) {
+            page_vals.push(v);
+        }
+    }
+    if filled < 4 || (page_vals.len() as f32) < 0.7 * filled as f32 {
+        return false;
+    }
+
+    // First column: mostly text titles (has alphabetic content). This rejects
+    // numeric-vs-numeric grids.
+    let text_first = cells
+        .iter()
+        .filter(|row| {
+            row.first()
+                .is_some_and(|c| c.chars().any(|ch| ch.is_alphabetic()))
+        })
+        .count();
+    if (text_first as f32) < 0.6 * cells.len() as f32 {
+        return false;
+    }
+
+    // Page numbers mostly ascend (allow front-matter→body resets and noise).
+    if page_vals.len() < 2 {
+        return false;
+    }
+    let non_decreasing = page_vals.windows(2).filter(|w| w[1] >= w[0]).count();
+    if (non_decreasing as f32) < 0.7 * (page_vals.len() - 1) as f32 {
+        return false;
+    }
+
+    // Stronger TOC signal. Real page numbers SPAN the document — entries skip
+    // (3, 6, 13, 24, …) so their range exceeds the entry count. A rank / ID /
+    // ordinal column is instead a *perfectly dense* consecutive run (1,2,3,… or
+    // 100,101,102,…). Accept anything with page gaps; for a dense run — which a
+    // one-page-per-entry TOC can also produce — fall back to a title signal:
+    // real contents entries are multi-word headings, rank labels are short.
+    let min = *page_vals.iter().min().unwrap();
+    let max = *page_vals.iter().max().unwrap();
+    let span = max.saturating_sub(min);
+    if span > page_vals.len() as u32 {
+        return true;
+    }
+    let dense_consecutive = (span as usize) + 1 == page_vals.len() && {
+        let mut sorted = page_vals.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        sorted.len() == page_vals.len()
+    };
+    if !dense_consecutive {
+        // Narrow range but with a gap or repeat — still contents-like.
+        return true;
+    }
+    // Dense counter: only a TOC if the titles read like headings, not the
+    // short single-word labels typical of rank/leaderboard/ID tables.
+    let (total_words, titled_rows) = cells
+        .iter()
+        .filter_map(|row| row.first())
+        .filter(|c| c.chars().any(|ch| ch.is_alphabetic()))
+        .fold((0usize, 0usize), |(w, n), c| {
+            (
+                w + c
+                    .split_whitespace()
+                    .filter(|t| t.chars().any(|ch| ch.is_alphabetic()))
+                    .count(),
+                n + 1,
+            )
+        });
+    titled_rows > 0 && (total_words as f32) / titled_rows as f32 >= 1.8
 }
 
 /// Dot-leader TOC: any "Chapter 1 ........ 42" style with explicit leader
@@ -1510,11 +2607,11 @@ fn try_add_label_column(
 
     table.columns.insert(0, label_col_x);
     for (row_idx, row_labels) in label_items_per_row.iter().enumerate() {
-        let label_text = row_labels
-            .iter()
-            .map(|(_, item)| item.text.as_str())
-            .collect::<Vec<_>>()
-            .join(" ");
+        let mut label_text = String::new();
+        let mut last = None;
+        for (_, item) in row_labels {
+            super::cell_text::push_cell_item(&mut label_text, &mut last, item, &item.text);
+        }
         table.cells[row_idx].insert(0, label_text);
         for (idx, _) in row_labels {
             table.item_indices.push(*idx);
@@ -1524,7 +2621,910 @@ fn try_add_label_column(
 
 #[cfg(test)]
 mod tests {
+    fn contents_item(text: &str, x: f32, y: f32, width: f32) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x,
+            y,
+            width,
+            height: 9.5,
+            font: "Body".to_string(),
+            font_tag: String::new(),
+            font_size: 9.5,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
+            is_underline: false,
+            is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
+            item_type: crate::types::ItemType::Text,
+            mcid: None,
+            baseline_shift: 0.0,
+            legacy_symbol_rewrite: false,
+        }
+    }
+
+    #[test]
+    fn contents_list_with_author_rows_between_entries_is_a_toc() {
+        // The shape of a book's contents page: entry titles at the left,
+        // page numbers sharing a right edge at 362pt, and the chapter
+        // authors on their own rows without a number. Too left-heavy for
+        // the generic column finder, but a contents list all the same.
+        let items = vec![
+            contents_item("List of figures", 68.0, 483.6, 52.0),
+            contents_item("vii", 352.0, 483.6, 10.0),
+            contents_item("List of tables", 68.0, 470.6, 48.0),
+            contents_item("ix", 354.6, 470.6, 7.4),
+            contents_item("List of abbreviations", 68.0, 457.6, 79.0),
+            contents_item("x", 357.2, 457.6, 4.8),
+            contents_item("List of contributors", 68.0, 444.6, 74.0),
+            contents_item("xi", 354.6, 444.6, 7.4),
+            contents_item("Introduction", 68.0, 418.6, 50.0),
+            contents_item("1", 356.0, 418.6, 6.0),
+            contents_item("Lise Jaillant, Claire Warwick", 81.0, 405.6, 120.0),
+            contents_item("1", 68.0, 379.6, 6.0),
+            contents_item("The National Archives (UK)", 81.0, 379.6, 110.0),
+            contents_item("15", 350.0, 379.6, 12.0),
+            contents_item("Lise Jaillant and Annalina Caputo", 81.0, 366.6, 130.0),
+            contents_item("2", 68.0, 340.6, 6.0),
+            contents_item("Computer vision and cultural heritage", 81.0, 340.6, 150.0),
+            contents_item("41", 350.0, 340.6, 12.0),
+            contents_item("3 Machine learning ..........", 68.0, 327.6, 200.0),
+            contents_item("........", 270.0, 327.6, 60.0),
+            contents_item("61", 350.0, 327.6, 12.0),
+            contents_item("4 Digital mapping ···········", 68.0, 314.6, 200.0),
+            contents_item("93", 350.0, 314.6, 12.0),
+            contents_item("4.3.3.4", 68.0, 301.6, 30.0),
+            contents_item("MASK", 100.0, 301.6, 30.0),
+            contents_item("97", 350.0, 301.6, 12.0),
+            contents_item("6.8 USAMO 2026", 68.0, 288.6, 80.0),
+            contents_item("191", 350.0, 288.6, 18.0),
+            // A footnote marker on an entry, and a page number 14pt off the edge.
+            contents_item("5 Digital archives", 68.0, 275.6, 90.0),
+            {
+                let mut marker = contents_item("1", 158.5, 279.6, 3.0);
+                marker.font_size = 6.0;
+                marker.height = 6.0;
+                marker.baseline_shift = 4.0;
+                marker
+            },
+            contents_item("120", 330.0, 275.6, 18.0),
+        ];
+        let indexed: Vec<(usize, &TextItem)> = items.iter().enumerate().collect();
+        let table = detect_contents_list(&indexed).expect("contents list");
+        assert_eq!(table.kind, crate::tables::TableKind::Toc);
+        assert_eq!(table.cells.len(), 14, "{:?}", table.cells);
+        assert_eq!(table.cells[0], vec!["List of figures", "vii"]);
+        assert_eq!(table.cells[5], vec!["Lise Jaillant, Claire Warwick", ""]);
+        assert_eq!(table.cells[6], vec!["1 The National Archives (UK)", "15"]);
+        assert_eq!(
+            table.cells[8],
+            vec!["2 Computer vision and cultural heritage", "41"]
+        );
+        // Leader dots — full stops or middle dots, glued to the title or in
+        // their own item — are not part of the entry.
+        assert_eq!(table.cells[9], vec!["3 Machine learning", "61"]);
+        assert_eq!(table.cells[10], vec!["4 Digital mapping", "93"]);
+        // A section number is set aside before letters are weighed against
+        // digits: short titles with dotted numbers and years are entries.
+        assert_eq!(table.cells[11], vec!["4.3.3.4 MASK", "97"]);
+        assert_eq!(table.cells[12], vec!["6.8 USAMO 2026", "191"]);
+        // The marker stays in its title and a number 14pt off the shared edge
+        // still gets its own cell.
+        assert_eq!(table.cells[13], vec!["5 Digital archives 1", "120"]);
+
+        // Through the region entry point the marker is a script item; it
+        // still lands in its entry's title rather than in the text flow.
+        let marker_idx = items.iter().position(|i| i.baseline_shift != 0.0).unwrap();
+        let via_region = detect_table_in_region(&indexed, TableDetectionMode::BodyFont, &|idx| {
+            idx == marker_idx
+        })
+        .expect("contents list through the region entry point");
+        assert_eq!(via_region.kind, crate::tables::TableKind::Toc);
+        assert_eq!(via_region.cells[13], vec!["5 Digital archives 1", "120"]);
+        assert!(via_region.item_indices.contains(&marker_idx));
+        assert_eq!(table.item_indices.len(), items.len());
+    }
+
+    #[test]
+    fn contents_list_keeps_chapter_labels_trailing_markers_and_full_stops() {
+        // "Chapter n" labels climb by one down the page, as a second column's
+        // page numbers would — but a label is part of the title.
+        let titles = [
+            "Chapter 1 Introduction",
+            "Chapter 2 Data protection",
+            "Chapter 3 Methods ......",
+            "Chapter 4 Results . . . .",
+            "Chapter 5 Conclusions.",
+            "Chapter 6 Outlook",
+        ];
+        let pages = ["10", "25", "41", "58", "77", "90"];
+        let mut items: Vec<TextItem> = Vec::new();
+        for (r, (title, page)) in titles.iter().zip(pages).enumerate() {
+            let y = 500.0 - r as f32 * 13.0;
+            items.push(contents_item(title, 68.0, y, 150.0));
+            items.push(contents_item(page, 350.0, y, 12.0));
+            if r == 5 {
+                // A footnote marker after the page number, reading as a page
+                // number smaller than the first entry\'s.
+                let mut marker = contents_item("1", 364.0, y + 4.0, 3.0);
+                marker.font_size = 6.0;
+                marker.height = 6.0;
+                marker.baseline_shift = 4.0;
+                items.push(marker);
+            }
+        }
+        let indexed: Vec<(usize, &TextItem)> = items.iter().enumerate().collect();
+        let table = detect_contents_list(&indexed).expect("chapter-labelled contents list");
+        assert_eq!(table.cells.len(), 6, "{:?}", table.cells);
+        assert_eq!(table.cells[0], vec!["Chapter 1 Introduction", "10"]);
+        // The page number is the last text item; the marker after it stays
+        // with its entry and never stands in for the page.
+        assert_eq!(table.cells[1], vec!["Chapter 2 Data protection", "25"]);
+        assert_eq!(table.cells[5], vec!["Chapter 6 Outlook 1", "90"]);
+        assert_eq!(table.item_indices.len(), items.len());
+        // A leader run goes; a title's own full stop stays.
+        assert_eq!(table.cells[2], vec!["Chapter 3 Methods", "41"]);
+        assert_eq!(table.cells[3], vec!["Chapter 4 Results", "58"]);
+        assert_eq!(table.cells[4], vec!["Chapter 5 Conclusions.", "77"]);
+    }
+
+    #[test]
+    fn contents_list_leaves_a_headed_rank_table_to_the_generic_path() {
+        let rows = |header: Option<(&str, f32, f32)>| -> Vec<TextItem> {
+            let mut items = Vec::new();
+            if let Some((text, x, width)) = header {
+                items.push(contents_item(text, x, 520.0, width));
+            }
+            for (r, title) in [
+                "Northern region office",
+                "Coastal distribution hub",
+                "Mountain research station",
+                "Central logistics depot",
+                "Southern service centre",
+            ]
+            .iter()
+            .enumerate()
+            {
+                let y = 500.0 - r as f32 * 13.0;
+                items.push(contents_item(title, 68.0, y, 130.0));
+                items.push(contents_item(&format!("{}", r + 1), 356.0, y, 6.0));
+            }
+            items
+        };
+        // "Rank" over the number column: a data table, even though every
+        // label is multi-word and the numbers climb by one.
+        let table = rows(Some(("Rank", 344.0, 24.0)));
+        let indexed: Vec<(usize, &TextItem)> = table.iter().enumerate().collect();
+        assert!(detect_contents_list(&indexed).is_none());
+        // A title row that stays clear of the numbers is not a header; the
+        // same rows are a one-page-per-entry contents list.
+        let contents = rows(Some(("Where to find us", 68.0, 90.0)));
+        let indexed: Vec<(usize, &TextItem)> = contents.iter().enumerate().collect();
+        let toc = detect_contents_list(&indexed).expect("dense contents list");
+        assert_eq!(toc.cells[0], vec!["Northern region office", "1"]);
+        // A footnote marker on that title, raised into the number band, is
+        // not a header either.
+        let mut marked = contents;
+        let mut marker = contents_item("1", 358.0, 524.0, 3.0);
+        marker.font_size = 6.0;
+        marker.height = 6.0;
+        marker.baseline_shift = 4.0;
+        marked.push(marker);
+        let indexed: Vec<(usize, &TextItem)> = marked.iter().enumerate().collect();
+        let toc = detect_contents_list(&indexed).expect("dense contents list under a marked title");
+        assert_eq!(toc.cells[0], vec!["Northern region office", "1"]);
+    }
+
+    #[test]
+    fn contents_list_needs_page_numbers_on_one_edge_and_enough_of_them() {
+        // Amounts with thousands separators are not page numbers …
+        let data: Vec<TextItem> = (0..5)
+            .flat_map(|r| {
+                let y = 500.0 - r as f32 * 13.0;
+                [
+                    contents_item("Revenue segment", 68.0, y, 70.0),
+                    contents_item("1,234", 340.0, y, 24.0),
+                ]
+            })
+            .collect();
+        let indexed: Vec<(usize, &TextItem)> = data.iter().enumerate().collect();
+        assert!(detect_contents_list(&indexed).is_none());
+
+        // … three numbered rows are too few …
+        let short: Vec<TextItem> = (0..3)
+            .flat_map(|r| {
+                let y = 500.0 - r as f32 * 13.0;
+                [
+                    contents_item("Chapter title", 68.0, y, 70.0),
+                    contents_item(&format!("{}", 10 + r * 7), 350.0, y, 12.0),
+                ]
+            })
+            .collect();
+        let indexed: Vec<(usize, &TextItem)> = short.iter().enumerate().collect();
+        assert!(detect_contents_list(&indexed).is_none());
+
+        // … a data row with columns between the title and its last number is
+        // no entry (a feature matrix whose "x" marks read as roman ten) …
+        let matrix: Vec<TextItem> = (0..5)
+            .flat_map(|r| {
+                let y = 500.0 - r as f32 * 13.0;
+                [
+                    contents_item("Edge Port Module (EPORT)", 68.0, y, 110.0),
+                    contents_item("x", 220.0, y, 6.0),
+                    contents_item("x", 280.0, y, 6.0),
+                    contents_item("x", 340.0, y, 6.0),
+                    contents_item("x", 400.0, y, 6.0),
+                ]
+            })
+            .collect();
+        let indexed: Vec<(usize, &TextItem)> = matrix.iter().enumerate().collect();
+        assert!(detect_contents_list(&indexed).is_none());
+
+        // … a statistical table's data rows, digits through and through, are
+        // no entries even when they end in a small number …
+        let statistics: Vec<TextItem> = (0..6)
+            .flat_map(|r| {
+                let y = 500.0 - r as f32 * 13.0;
+                [
+                    contents_item(
+                        &format!("2023: Jan ...... 6,{}02 2,328 2,292 1,583 4,698", r),
+                        68.0,
+                        y,
+                        260.0,
+                    ),
+                    contents_item(&format!("{}", 160 + r * 9), 350.0, y, 12.0),
+                ]
+            })
+            .collect();
+        let indexed: Vec<(usize, &TextItem)> = statistics.iter().enumerate().collect();
+        assert!(detect_contents_list(&indexed).is_none());
+
+        // … a footnote block whose raised markers land at the ends of the
+        // lines above them is prose, not a list …
+        // The markers are 6.5pt, at the left margin, raised 4.5pt off the
+        // footnote below — and not flagged as scripts.
+        let footnotes: Vec<TextItem> = (0..5)
+            .flat_map(|r| {
+                let y = 500.0 - r as f32 * 11.5;
+                let mut marker = contents_item(&format!("{}", 68 + r), 72.0, y - 7.0, 6.5);
+                marker.font_size = 6.5;
+                marker.height = 6.5;
+                [
+                    contents_item(
+                        "stick to a mere analogy between desire and perception",
+                        72.0,
+                        y,
+                        218.9,
+                    ),
+                    marker,
+                ]
+            })
+            .collect();
+        let indexed: Vec<(usize, &TextItem)> = footnotes.iter().enumerate().collect();
+        assert!(detect_contents_list(&indexed).is_none());
+
+        // … two contents columns side by side are not one list …
+        let two_columns: Vec<TextItem> = (0..6)
+            .flat_map(|r| {
+                let y = 500.0 - r as f32 * 13.0;
+                [
+                    contents_item(
+                        &format!("The MTU Group {} Glossary of engine terms", 47 + r * 12),
+                        68.0,
+                        y,
+                        260.0,
+                    ),
+                    contents_item(&format!("{}", 347 + r), 350.0, y, 18.0),
+                ]
+            })
+            .collect();
+        let indexed: Vec<(usize, &TextItem)> = two_columns.iter().enumerate().collect();
+        assert!(detect_contents_list(&indexed).is_none());
+
+        // … period rows keep their year in the digit count and stay data …
+        let periods: Vec<TextItem> = (0..5)
+            .flat_map(|r| {
+                let y = 500.0 - r as f32 * 13.0;
+                [
+                    contents_item(&format!("20{}: Q1 revenue", 20 + r), 68.0, y, 90.0),
+                    contents_item(&format!("{}", 100 + r * 20), 350.0, y, 18.0),
+                ]
+            })
+            .collect();
+        let indexed: Vec<(usize, &TextItem)> = periods.iter().enumerate().collect();
+        assert!(detect_contents_list(&indexed).is_none());
+
+        // … a table header whose rows all end in the same value is no list …
+        let header: Vec<TextItem> = (0..5)
+            .flat_map(|r| {
+                let y = 500.0 - r as f32 * 13.0;
+                [
+                    contents_item("Both sexes 16 years and over", 68.0, y, 140.0),
+                    contents_item("20", 350.0, y, 12.0),
+                ]
+            })
+            .collect();
+        let indexed: Vec<(usize, &TextItem)> = header.iter().enumerate().collect();
+        assert!(detect_contents_list(&indexed).is_none());
+
+        // … and numbers scattered across the row are a data column, not a list.
+        let ragged: Vec<TextItem> = (0..5)
+            .flat_map(|r| {
+                let y = 500.0 - r as f32 * 13.0;
+                [
+                    contents_item("Chapter title", 68.0, y, 70.0),
+                    contents_item(&format!("{}", 10 + r * 7), 250.0 + r as f32 * 30.0, y, 12.0),
+                ]
+            })
+            .collect();
+        let indexed: Vec<(usize, &TextItem)> = ragged.iter().enumerate().collect();
+        assert!(detect_contents_list(&indexed).is_none());
+    }
+
+    fn make_item(text: &str, x: f32, y: f32, font_size: f32, width: f32) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x,
+            y,
+            width,
+            height: font_size,
+            font: "TestFont".to_string(),
+            font_tag: String::new(),
+            legacy_symbol_rewrite: false,
+            font_size,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
+            is_underline: false,
+            is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
+            item_type: ItemType::Text,
+            mcid: None,
+            baseline_shift: 0.0,
+        }
+    }
+
+    #[test]
+    fn script_attachment_detects_subscript_after_body_text() {
+        let body = make_item("log", 100.0, 500.0, 10.0, 15.0);
+        let sub = make_item("10", 115.5, 497.0, 7.0, 7.0);
+        let items = vec![body, sub.clone()];
+        assert!(ScriptBodyIndex::new(&items).is_script_attachment(&sub, 0.0));
+    }
+
+    #[test]
+    fn script_attachment_detects_superscript_footnote_marker() {
+        let body = make_item("Hartley", 200.0, 500.0, 10.0, 35.0);
+        let sup = make_item("2", 235.8, 504.0, 6.6, 3.5);
+        let items = vec![body, sup.clone()];
+        assert!(ScriptBodyIndex::new(&items).is_script_attachment(&sup, 0.0));
+    }
+
+    #[test]
+    fn script_attachment_ignores_small_cell_far_from_body_text() {
+        let body = make_item("Revenue", 100.0, 500.0, 10.0, 40.0);
+        let cell = make_item("1,234", 180.0, 500.0, 7.0, 20.0);
+        let items = vec![body, cell.clone()];
+        assert!(!ScriptBodyIndex::new(&items).is_script_attachment(&cell, 0.0));
+    }
+
+    #[test]
+    fn body_pass_anchor_spares_cells_beside_slightly_larger_labels() {
+        // A body-font table cell (10pt) sitting beside a slightly larger,
+        // NON-heading label (12.5pt) with a little baseline jitter. The
+        // small-font pass treats any larger neighbour as a possible script
+        // base, but the body pass must not: at body sizes a slightly larger
+        // neighbour is a bold label or column header, and flagging the cell
+        // would strip it out of the table geometry and lose the table.
+        // Cell at the low end of the body band (0.85x base) beside a 10.5pt
+        // label. 10.5 clears the inherent 1.2x-of-cell rule (10.2) but falls
+        // below the body pass's heading anchor (11.5), which is exactly the
+        // band where the two masks must disagree.
+        let label = make_item("Revenue", 100.0, 500.0, 10.5, 40.0);
+        let cell = make_item("1,234", 141.0, 496.5, 8.5, 22.0);
+        let items = vec![label, cell.clone()];
+        let index = ScriptBodyIndex::new(&items);
+        let base = 10.0;
+        assert!(
+            index.is_script_attachment(&cell, 0.0),
+            "small-font pass anchor should still see this as an attachment"
+        );
+        assert!(
+            !index.is_script_attachment(&cell, base * 1.15),
+            "body pass must not treat a cell beside a slightly larger label \
+             as a script — that removes real cells from the geometry"
+        );
+        // A genuine heading-sized anchor still qualifies in the body pass.
+        let heading = make_item("Section", 100.0, 500.0, 20.0, 60.0);
+        let sup = make_item("3", 161.0, 508.0, 10.0, 5.0);
+        let h_items = vec![heading, sup.clone()];
+        assert!(
+            ScriptBodyIndex::new(&h_items).is_script_attachment(&sup, base * 1.15),
+            "script hanging off a heading must still be excluded in the body pass"
+        );
+    }
+
+    #[test]
+    fn script_attachment_ignores_same_baseline_neighbor_cell() {
+        // A small cell beside a larger label on the SAME baseline is a table
+        // layout, not a subscript — a genuine baseline offset is required.
+        let label = make_item("Total", 100.0, 500.0, 10.0, 25.0);
+        let cell = make_item("42", 127.0, 500.0, 7.5, 9.0);
+        let items = vec![label, cell.clone()];
+        assert!(!ScriptBodyIndex::new(&items).is_script_attachment(&cell, 0.0));
+    }
+
+    #[test]
+    fn script_attachment_ignores_neighbor_on_different_line() {
+        let body = make_item("Header", 100.0, 500.0, 10.0, 30.0);
+        let cell = make_item("42", 131.0, 486.0, 7.0, 10.0);
+        let items = vec![body, cell.clone()];
+        assert!(!ScriptBodyIndex::new(&items).is_script_attachment(&cell, 0.0));
+    }
+
+    /// Equation-subscript + footnote layout from Shannon entropy.pdf page 1,
+    /// with real coordinates. Without the larger-font anchors the small items
+    /// alone DO form a phantom table — proving the layout reaches detection —
+    /// and adding the anchors must suppress it.
+    fn shannon_page1_small_items() -> Vec<TextItem> {
+        vec![
+            make_item("2", 267.4, 133.9, 7.4, 3.7),
+            make_item("10", 306.2, 133.9, 7.4, 7.4),
+            make_item("10", 342.7, 133.9, 7.4, 7.4),
+            make_item("10", 325.0, 118.9, 7.4, 7.4),
+            make_item("Bell System Technical Journal,", 295.7, 101.9, 8.0, 95.0),
+            make_item(
+                "April 1924, p. 324; Certain Topics in",
+                396.7,
+                101.9,
+                8.0,
+                130.0,
+            ),
+            make_item("v. 47, April 1928, p. 617.", 250.9, 92.5, 8.0, 90.0),
+            make_item("Bell System Technical Journal,", 264.2, 82.6, 8.0, 95.0),
+            make_item("July 1928, p. 535.", 364.3, 82.6, 8.0, 65.0),
+        ]
+    }
+
+    #[test]
+    fn equation_scripts_do_not_form_phantom_table() {
+        let bare = shannon_page1_small_items();
+        assert!(
+            !detect_tables(&bare, 10.0, false).is_empty(),
+            "test layout must form a phantom table when the filter cannot fire"
+        );
+        let mut items = shannon_page1_small_items();
+        items.push(make_item("log", 253.0, 137.0, 10.0, 13.5));
+        items.push(make_item("log", 291.5, 137.0, 10.0, 13.5));
+        items.push(make_item("log", 328.0, 137.0, 10.0, 13.5));
+        items.push(make_item("log", 310.3, 122.0, 10.0, 13.5));
+        let tables = detect_tables(&items, 10.0, false);
+        assert!(
+            tables.is_empty(),
+            "equation scripts + footnotes must not become a table: {tables:?}"
+        );
+    }
     use super::*;
+    use crate::types::ItemType;
+
+    fn body_item(text: &str, x: f32, y: f32, strikeout: bool) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x,
+            y,
+            width: 90.0,
+            height: 12.0,
+            font: "F1".to_string(),
+            font_tag: String::new(),
+            legacy_symbol_rewrite: false,
+            font_size: 12.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
+            is_underline: false,
+            is_strikeout: strikeout,
+            rotation: 0.0,
+            advance_known: true,
+            item_type: ItemType::Text,
+            mcid: None,
+            baseline_shift: 0.0,
+        }
+    }
+
+    #[test]
+    fn merge_adjacent_items_preserves_redline_boundaries() {
+        let old = body_item("old value", 220.0, 700.0, true);
+        let mut replacement = body_item("new value", 312.0, 700.0, false);
+        replacement.is_underline = true;
+        let preserved_indices = std::collections::HashSet::from([1]);
+
+        let (merged, index_map) =
+            merge_adjacent_items_preserving(&[old, replacement], &preserved_indices);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(index_map, vec![vec![0], vec![1]]);
+        assert!(merged[0].is_strikeout);
+        assert!(merged[1].is_underline);
+    }
+
+    #[test]
+    fn merge_adjacent_items_keeps_boundary_after_preserved_fragment() {
+        let mut prefix = body_item("prefix", 20.0, 700.0, false);
+        prefix.is_underline = true;
+        let mut replacement = body_item("replacement", 111.0, 700.0, false);
+        replacement.is_underline = true;
+        let deleted = body_item("deleted", 202.0, 700.0, true);
+        let preserved_indices = std::collections::HashSet::from([1]);
+
+        let (merged, index_map) =
+            merge_adjacent_items_preserving(&[prefix, replacement, deleted], &preserved_indices);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(index_map, vec![vec![0, 1], vec![2]]);
+        assert!(merged[0].is_underline);
+        assert!(merged[1].is_strikeout);
+    }
+
+    #[test]
+    fn merge_adjacent_items_keeps_preserved_fragment_out_of_mixed_run() {
+        let mut prefix = body_item("prefix", 20.0, 700.0, false);
+        prefix.is_underline = true;
+        let deleted = body_item("deleted", 111.0, 700.0, true);
+        let mut replacement = body_item("replacement", 202.0, 700.0, false);
+        replacement.is_underline = true;
+        let preserved_indices = std::collections::HashSet::from([2]);
+
+        let (merged, index_map) =
+            merge_adjacent_items_preserving(&[prefix, deleted, replacement], &preserved_indices);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(index_map, vec![vec![0, 1], vec![2]]);
+        assert!(merged[0].is_underline);
+        assert!(merged[1].is_underline);
+    }
+
+    #[test]
+    fn body_font_redline_deletions_do_not_create_a_table() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("live paragraph text", 50.0, y, false));
+            items.push(body_item("deleted wording", 220.0, y, true));
+        }
+
+        assert!(
+            detect_tables(&items, 12.0, false).is_empty(),
+            "aligned strikeout overlays are source edits, not table columns"
+        );
+    }
+
+    #[test]
+    fn underlined_body_font_table_without_deletions_is_still_detected() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            let mut value = body_item("row value", 220.0, y, false);
+            value.is_underline = true;
+            items.push(value);
+        }
+
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "underline-only tables must keep their heuristic evidence"
+        );
+    }
+
+    #[test]
+    fn body_font_table_with_one_deletion_is_still_detected() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            items.push(body_item("row value", 220.0, y, row == 0));
+        }
+
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "one revised cell must not suppress an otherwise complete table"
+        );
+    }
+
+    #[test]
+    fn unrelated_strikeout_does_not_remove_underlined_table_evidence() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            let mut value = body_item("row value", 220.0, y, false);
+            value.is_underline = true;
+            items.push(value);
+        }
+        items.push(body_item("deleted prose", 50.0, 300.0, true));
+
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "a distant deletion must not suppress underlined table columns"
+        );
+    }
+
+    #[test]
+    fn nearby_redline_rows_do_not_remove_plain_table_evidence() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            items.push(body_item("row value", 220.0, y, false));
+        }
+        for y in [700.0, 652.0, 604.0] {
+            items.push(body_item("deleted prose", 400.0, y, true));
+        }
+
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "redline rows must suppress decorations, not nearby live table cells"
+        );
+    }
+
+    #[test]
+    fn separate_strikeout_columns_do_not_suppress_content_between_them() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 160.0, y, false));
+            items.push(body_item("row value", 280.0, y, false));
+        }
+        for (row, y) in [700.0, 684.0, 668.0, 652.0].into_iter().enumerate() {
+            let x = if row % 2 == 0 { 50.0 } else { 420.0 };
+            let mut deletion = body_item("old", x, y, true);
+            deletion.width = 30.0;
+            items.push(deletion);
+        }
+
+        let regions = redline_edit_regions(&items, content_width(&items));
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].x_ranges.len(), 2);
+        assert!(!regions[0].spans_page_width);
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "separate edit columns must not create a suppression bridge across the page"
+        );
+    }
+
+    #[test]
+    fn wide_redline_rows_do_not_turn_fragmented_prose_into_a_table() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("line number", 50.0, y, false));
+            items.push(body_item("live prose fragment", 160.0, y, false));
+            let strikeout_x = if row % 2 == 0 { 280.0 } else { 430.0 };
+            items.push(body_item("deleted prose", strikeout_x, y, true));
+        }
+
+        assert!(
+            detect_tables(&items, 12.0, false).is_empty(),
+            "full-width redline prose must not retain table-shaped fragments"
+        );
+    }
+
+    #[test]
+    fn wide_redline_prose_ignores_underlines_outside_edit_span() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            let mut line_number = body_item("line number", 50.0, y, false);
+            line_number.is_underline = row < 2;
+            items.push(line_number);
+            items.push(body_item("live prose fragment", 160.0, y, false));
+            let strikeout_x = if row % 2 == 0 { 280.0 } else { 430.0 };
+            items.push(body_item("deleted prose", strikeout_x, y, true));
+        }
+
+        assert!(redline_edit_regions(&items, content_width(&items))[0].spans_page_width);
+        assert!(
+            detect_tables(&items, 12.0, false).is_empty(),
+            "underlines outside the edit span must not disable the wide-prose veto"
+        );
+    }
+
+    #[test]
+    fn nearby_redline_rows_do_not_remove_separate_underlined_table_evidence() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            let mut value = body_item("row value", 220.0, y, false);
+            value.is_underline = true;
+            items.push(value);
+        }
+        for y in [700.0, 652.0, 604.0] {
+            items.push(body_item("deleted prose", 400.0, y, true));
+        }
+
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "redline rows must not suppress a horizontally separate underlined table"
+        );
+    }
+
+    #[test]
+    fn multiple_revised_rows_do_not_remove_underlined_table_column() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            let replacement_x = 220.0 + (row % 2) as f32 * 2.0;
+            let mut value = body_item("new value", replacement_x, y, false);
+            value.is_underline = true;
+            items.push(value);
+        }
+        for y in [700.0, 652.0, 604.0] {
+            items.push(body_item("old value", 220.0, y, true));
+        }
+
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "aligned replacement cells must preserve a partially revised table"
+        );
+    }
+
+    #[test]
+    fn single_replacement_uses_aligned_live_table_rows() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            let mut value = body_item("row value", 220.0, y, false);
+            value.is_underline = row == 0;
+            items.push(value);
+        }
+        for y in [700.0, 652.0, 604.0] {
+            items.push(body_item("old value", 220.0, y, true));
+        }
+
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "one replacement cell must retain its aligned live table column"
+        );
+    }
+
+    #[test]
+    fn wide_revised_table_keeps_repeated_replacement_evidence() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            let mut value = body_item("row value", 220.0, y, false);
+            value.is_underline = row < 2;
+            items.push(value);
+            let strikeout_x = if row % 2 == 0 { 220.0 } else { 400.0 };
+            items.push(body_item("old value", strikeout_x, y, true));
+        }
+
+        assert!(redline_edit_regions(&items, content_width(&items))[0].spans_page_width);
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "wide edits must keep a table column with repeated replacements"
+        );
+    }
+
+    #[test]
+    fn revised_financial_columns_survive_item_expansion() {
+        let mut items = Vec::new();
+        for row in 0..4 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            items.push(body_item("old value", 180.0, y, true));
+            let mut values = body_item("$ 100 $ 200 $ 300", 180.0, y, false);
+            values.width = 300.0;
+            values.is_underline = true;
+            items.push(values);
+        }
+
+        let tables = detect_tables(&items, 12.0, false);
+        assert!(
+            tables.iter().any(|table| table.columns.len() >= 4),
+            "all expanded financial columns must inherit their source evidence"
+        );
+    }
+
+    #[test]
+    fn narrow_layout_band_uses_full_page_width_for_redline_scope() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 190.0, y, false));
+            items.push(body_item("old value", 300.0, y, true));
+            let mut replacement = body_item("new value", 300.0, y, false);
+            replacement.is_underline = true;
+            items.push(replacement);
+        }
+
+        assert!(redline_edit_regions(&items, content_width(&items))[0].spans_page_width);
+        assert!(!redline_edit_regions(&items, 500.0)[0].spans_page_width);
+        assert!(
+            !detect_tables_with_page_width(&items, 12.0, false, 500.0).is_empty(),
+            "a narrow band must use full-page context to preserve revised table cells"
+        );
+    }
+
+    #[test]
+    fn adjacent_revised_fragments_preserve_live_table_cells() {
+        let mut items = Vec::new();
+        for row in 0..4 {
+            let y = 700.0 - row as f32 * 16.0;
+            items.push(body_item("row label", 50.0, y, false));
+            items.push(body_item("old value", 220.0, y, true));
+            let mut replacement = body_item("new value", 312.0, y, false);
+            replacement.is_underline = true;
+            items.push(replacement);
+        }
+
+        assert!(
+            !detect_tables(&items, 12.0, false).is_empty(),
+            "adjacent old/new fragments must retain the live revised cells"
+        );
+    }
+
+    #[test]
+    fn small_toc_fragments_are_classified() {
+        // 3-row section fragment: multi-word titles, strictly ascending pages.
+        let rows = |v: &[(&str, &str)]| -> Vec<Vec<String>> {
+            v.iter()
+                .map(|(a, b)| vec![a.to_string(), b.to_string()])
+                .collect()
+        };
+        assert!(is_table_of_contents(&rows(&[
+            ("Section 4.1: Examining Relationships", "29"),
+            ("Section 4.2: Correlation Assumptions", "31"),
+            ("Section 4.3: Chapter Four Self-Test", "33"),
+        ])));
+        // 2-row fragment under the same strict rules.
+        assert!(is_table_of_contents(&rows(&[
+            ("Section 6.3 Repeated Measures ANOVA", "54"),
+            ("Section 6.4: Chapter Six Self-Test", "62"),
+        ])));
+        // Leader dots glued to the page number, one title lost to a
+        // neighboring grid.
+        assert!(is_table_of_contents(&rows(&[
+            ("4. A Jewel in the Austrian Crown.", "..19"),
+            ("5. Meeting the Relatives..", "..37"),
+            ("", "..41"),
+            ("7. To the Bottom of the World......", ".53"),
+        ])));
+        // Single-word labels with ascending numbers stay a data table.
+        assert!(!is_table_of_contents(&rows(&[
+            ("Total", "54"),
+            ("Margin", "62"),
+        ])));
+        // Non-ascending page cells stay a data table.
+        assert!(!is_table_of_contents(&rows(&[
+            ("Net income before adjustments", "54"),
+            ("Gross margin excluding one-offs", "42"),
+        ])));
+    }
 
     #[test]
     fn is_table_of_contents_rejects_toc() {
@@ -1883,5 +3883,167 @@ mod tests {
         assert!(!starts_with_section_number("10.0%"));
         assert!(!starts_with_section_number(""));
         assert!(!starts_with_section_number("Hello world"));
+    }
+
+    #[test]
+    fn page_number_value_rejects_roman_lookalike_words() {
+        // Ordinary words made only of {i,v,x,l,c} are not page numbers.
+        assert!(page_number_value("civil").is_none());
+        assert!(page_number_value("mix").is_none());
+        assert!(page_number_value("ill").is_none());
+        assert!(page_number_value("lil").is_none());
+        // Canonical roman numerals still parse.
+        assert_eq!(page_number_value("vii"), Some(7));
+        assert_eq!(page_number_value("ix"), Some(9));
+        assert_eq!(page_number_value("xii"), Some(12));
+        assert_eq!(page_number_value("42"), Some(42));
+    }
+
+    #[test]
+    fn page_number_toc_matches_consecutive_pages_with_titles() {
+        // A short chapter-per-page contents: pages are a dense 1..n run, but
+        // the multi-word titles mark it as a real TOC (recovered by the title
+        // signal rather than rejected for lacking page gaps).
+        let cells: Vec<Vec<String>> = vec![
+            vec!["Introduction to the Study".into(), "1".into()],
+            vec!["Materials and Methods".into(), "2".into()],
+            vec!["Results and Discussion".into(), "3".into()],
+            vec!["Summary of Findings".into(), "4".into()],
+            vec!["References and Notes".into(), "5".into()],
+        ];
+        assert!(is_page_number_toc(&cells));
+    }
+
+    #[test]
+    fn page_number_toc_rejects_dense_ordinal_column() {
+        // Headerless title | rank table: values are a consecutive 1..n
+        // sequence (monotonic, no header, text first column) but their range
+        // ~= the row count, so it is data, not a table of contents.
+        let cells: Vec<Vec<String>> = vec![
+            vec!["Alice".into(), "1".into()],
+            vec!["Bob".into(), "2".into()],
+            vec!["Carol".into(), "3".into()],
+            vec!["Dave".into(), "4".into()],
+            vec!["Erin".into(), "5".into()],
+            vec!["Frank".into(), "6".into()],
+        ];
+        assert!(!is_page_number_toc(&cells));
+    }
+
+    #[test]
+    fn page_number_toc_rejects_blank_header_cell() {
+        // First row is a header whose last cell is blank ("Category | ");
+        // must not be flattened even though later rows look TOC-like.
+        let cells = vec![
+            vec!["Category".into(), "".into()],
+            vec!["Alpha".into(), "3".into()],
+            vec!["Beta".into(), "9".into()],
+            vec!["Gamma".into(), "14".into()],
+            vec!["Delta".into(), "20".into()],
+        ];
+        assert!(!is_page_number_toc(&cells));
+    }
+
+    #[test]
+    fn page_number_toc_matches_title_based_contents() {
+        // Title-left, page-number-right, no dot leaders, no section numbers.
+        let cells = vec![
+            vec!["About the Publisher".into(), "vii".into()],
+            vec!["About This Project".into(), "ix".into()],
+            vec!["Acknowledgments".into(), "xi".into()],
+            vec!["Experiment #1: Hydrostatic Pressure".into(), "3".into()],
+            vec!["Experiment #2: Bernoulli's Theorem".into(), "13".into()],
+            vec![
+                "Experiment #3: Energy Loss in Pipe Fittings".into(),
+                "24".into(),
+            ],
+        ];
+        assert!(is_page_number_toc(&cells));
+        assert!(is_table_of_contents(&cells));
+    }
+
+    #[test]
+    fn page_number_toc_rejects_numeric_data_table() {
+        // Real 2-col data table: numeric first column, non-monotonic values.
+        let cells = vec![
+            vec!["101".into(), "45".into()],
+            vec!["102".into(), "12".into()],
+            vec!["103".into(), "88".into()],
+            vec!["104".into(), "7".into()],
+            vec!["105".into(), "63".into()],
+        ];
+        assert!(!is_page_number_toc(&cells));
+    }
+
+    #[test]
+    fn page_number_toc_rejects_non_monotonic_pages() {
+        // Text labels but the "page" column jumps around — a small data table,
+        // not a contents listing. 5 rows so the row-count guard passes and the
+        // monotonicity check is what does the rejecting.
+        let cells: Vec<Vec<String>> = vec![
+            vec!["Apples".into(), "42".into()],
+            vec!["Oranges".into(), "7".into()],
+            vec!["Pears".into(), "91".into()],
+            vec!["Plums".into(), "3".into()],
+            vec!["Grapes".into(), "60".into()],
+        ];
+        // Sanity: this input clears the row-count and header guards, so a
+        // failure here is genuinely the monotonicity check.
+        assert!(cells.len() >= 5 && page_number_value(cells[0][1].trim()).is_some());
+        assert!(!is_page_number_toc(&cells));
+    }
+
+    #[test]
+    fn page_number_toc_rejects_header_row_data_table() {
+        // Real 2-col data table with a header row ("Mineral | CEC") and
+        // ascending values that mimic page numbers — the header tells us it
+        // is data, not contents.
+        let cells = vec![
+            vec![
+                "Mineral or colloid type".into(),
+                "CEC of pure colloid".into(),
+            ],
+            vec!["kaolinite".into(), "10".into()],
+            vec!["illite".into(), "30".into()],
+            vec!["montmorillonite".into(), "100".into()],
+            vec!["vermiculite".into(), "150".into()],
+        ];
+        assert!(!is_page_number_toc(&cells));
+    }
+
+    #[test]
+    fn page_number_toc_rejects_wide_data_grid() {
+        // A 4-column regional data table must not be read as a TOC even with a
+        // text first column and integer last column.
+        let cells = vec![
+            vec![
+                "REGIONS".into(),
+                "2007".into(),
+                "2010".into(),
+                "2016".into(),
+            ],
+            vec![
+                "National Capital Region".into(),
+                "9".into(),
+                "8".into(),
+                "5".into(),
+            ],
+            vec!["Cordillera".into(), "1".into(), "2".into(), "1".into()],
+            vec!["Ilocos Region".into(), "1".into(), "5".into(), "4".into()],
+            vec!["Cagayan Valley".into(), "1".into(), "3".into(), "5".into()],
+        ];
+        assert!(!is_page_number_toc(&cells));
+    }
+
+    #[test]
+    fn page_number_toc_needs_page_number_last_column() {
+        // Last column is prose, not page numbers.
+        let cells = vec![
+            vec!["Section A".into(), "see appendix".into()],
+            vec!["Section B".into(), "see notes".into()],
+            vec!["Section C".into(), "later".into()],
+            vec!["Section D".into(), "TBD".into()],
+        ];
+        assert!(!is_page_number_toc(&cells));
     }
 }

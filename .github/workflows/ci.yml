@@ -18,6 +18,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.98.0" # keep in sync with rust-toolchain.toml
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -34,6 +36,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.98.0" # keep in sync with rust-toolchain.toml
           components: rustfmt
 
       - name: Check formatting
@@ -48,6 +51,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.98.0" # keep in sync with rust-toolchain.toml
           components: clippy
 
       - name: Cache cargo
@@ -69,6 +73,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.98.0" # keep in sync with rust-toolchain.toml
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2

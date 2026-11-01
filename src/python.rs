@@ -30,9 +30,39 @@ pub struct PyPdfResult {
     /// 1-indexed page numbers that need OCR.
     #[pyo3(get)]
     pub pages_needing_ocr: Vec<u32>,
-    /// Title from PDF metadata.
+    /// Machine-readable OCR reasons by 1-indexed page.
+    #[pyo3(get)]
+    pub ocr_reasons_by_page: Vec<PyPageOcrReasons>,
+    /// The /Title of the document information dictionary, decoded as a PDF
+    /// text string (UTF-16 or UTF-8 after a byte order mark, PDFDocEncoding
+    /// otherwise). None when the entry is missing or not a string. The
+    /// entries below follow the same decoding and missing-value rule.
     #[pyo3(get)]
     pub title: Option<String>,
+    /// The document information dictionary's /Author.
+    #[pyo3(get)]
+    pub author: Option<String>,
+    /// The document information dictionary's /Subject.
+    #[pyo3(get)]
+    pub subject: Option<String>,
+    /// The document information dictionary's /Keywords.
+    #[pyo3(get)]
+    pub keywords: Option<String>,
+    /// The document information dictionary's /Creator: the application the
+    /// document was authored in.
+    #[pyo3(get)]
+    pub creator: Option<String>,
+    /// The document information dictionary's /Producer: the application that
+    /// wrote the PDF.
+    #[pyo3(get)]
+    pub producer: Option<String>,
+    /// The document information dictionary's /CreationDate as written, a PDF
+    /// date string such as "D:20240115103000+01'00'".
+    #[pyo3(get)]
+    pub creation_date: Option<String>,
+    /// The document information dictionary's /ModDate as written.
+    #[pyo3(get)]
+    pub mod_date: Option<String>,
     /// Detection confidence (0.0-1.0).
     #[pyo3(get)]
     pub confidence: f32,
@@ -48,6 +78,13 @@ pub struct PyPdfResult {
     /// Whether encoding issues were detected.
     #[pyo3(get)]
     pub has_encoding_issues: bool,
+    /// Fonts whose ToUnicode CMap — or, for a font without one, the embedded
+    /// program's cmap table — lacked an entry for a code the document shows
+    /// through it, with the counts of codes shown, read from their neighbours
+    /// and left as U+FFFD. Always empty for `detect_pdf`, which decodes no
+    /// text; otherwise empty when every such code had an entry.
+    #[pyo3(get)]
+    pub cmap_gaps: Vec<PyFontCMapGaps>,
 }
 
 #[pymethods]
@@ -56,6 +93,160 @@ impl PyPdfResult {
         format!(
             "PdfResult(pdf_type='{}', pages={}, confidence={:.2})",
             self.pdf_type, self.page_count, self.confidence
+        )
+    }
+}
+
+/// OCR reasons for a single 1-indexed page.
+#[pyclass(name = "PageOcrReasons")]
+#[derive(Clone)]
+pub struct PyPageOcrReasons {
+    /// 1-indexed page number.
+    #[pyo3(get)]
+    pub page: u32,
+    /// Machine-readable OCR reason identifiers.
+    #[pyo3(get)]
+    pub reasons: Vec<String>,
+}
+
+#[pymethods]
+impl PyPageOcrReasons {
+    fn __repr__(&self) -> String {
+        format!(
+            "PageOcrReasons(page={}, reasons={:?})",
+            self.page, self.reasons
+        )
+    }
+}
+
+/// A font whose ToUnicode CMap — or, for a font without one, the embedded
+/// program's cmap table — had no entry for some of the codes the document
+/// shows through it, and what became of those codes.
+#[pyclass(name = "FontCMapGaps")]
+#[derive(Clone)]
+pub struct PyFontCMapGaps {
+    /// The font's /BaseFont name, or its resource name when it has none.
+    #[pyo3(get)]
+    pub font: String,
+    /// Codes shown through the font's CMap, repeats included: two-byte codes,
+    /// or the bytes of a single-byte CMap.
+    #[pyo3(get)]
+    pub codes: u32,
+    /// Codes without an entry that were read from the mapped codes around them.
+    #[pyo3(get)]
+    pub interpolated: u32,
+    /// Codes without an entry that could not be read; each is a U+FFFD in the text.
+    #[pyo3(get)]
+    pub unmapped: u32,
+}
+
+#[pymethods]
+impl PyFontCMapGaps {
+    fn __repr__(&self) -> String {
+        format!(
+            "FontCMapGaps(font={:?}, codes={}, interpolated={}, unmapped={})",
+            self.font, self.codes, self.interpolated, self.unmapped
+        )
+    }
+}
+
+/// Exact OCR model identity retained in page provenance.
+#[pyclass(name = "OcrModelIdentity")]
+#[derive(Clone)]
+pub struct PyOcrModelIdentity {
+    #[pyo3(get)]
+    pub name: String,
+    #[pyo3(get)]
+    pub revision: String,
+}
+
+/// Per-page OCR processing timings.
+#[pyclass(name = "OcrTimings")]
+#[derive(Clone)]
+pub struct PyOcrTimings {
+    #[pyo3(get)]
+    pub render_ms: u64,
+    #[pyo3(get)]
+    pub ocr_ms: u64,
+    #[pyo3(get)]
+    pub assembly_ms: u64,
+}
+
+/// Source, model, confidence, and fallback metadata for one page.
+#[pyclass(name = "OcrPageProvenance")]
+#[derive(Clone)]
+pub struct PyOcrPageProvenance {
+    /// 1-indexed page number.
+    #[pyo3(get)]
+    pub page_number: u32,
+    /// "native", "ocr", or "fused".
+    #[pyo3(get)]
+    pub source: String,
+    #[pyo3(get)]
+    pub ocr_model: Option<PyOcrModelIdentity>,
+    #[pyo3(get)]
+    pub render_dpi: Option<f32>,
+    #[pyo3(get)]
+    pub ocr_confidence: Option<f32>,
+    #[pyo3(get)]
+    pub timings: PyOcrTimings,
+    #[pyo3(get)]
+    pub warnings: Vec<String>,
+    #[pyo3(get)]
+    pub hosted_recommended: bool,
+}
+
+/// Final Markdown and provenance for one page.
+#[pyclass(name = "OcrPageResult")]
+#[derive(Clone)]
+pub struct PyOcrPageResult {
+    /// 1-indexed page number.
+    #[pyo3(get)]
+    pub page_number: u32,
+    #[pyo3(get)]
+    pub markdown: String,
+    #[pyo3(get)]
+    pub provenance: PyOcrPageProvenance,
+}
+
+/// Complete native/OCR Markdown output.
+#[pyclass(name = "OcrPdfResult")]
+#[derive(Clone)]
+pub struct PyOcrPdfResult {
+    #[pyo3(get)]
+    pub markdown: String,
+    #[pyo3(get)]
+    pub pages: Vec<PyOcrPageResult>,
+    #[pyo3(get)]
+    pub page_count: u32,
+    #[pyo3(get)]
+    pub pages_recommended_for_ocr: Vec<u32>,
+    #[pyo3(get)]
+    pub pages_routed_to_ocr: Vec<u32>,
+    #[pyo3(get)]
+    pub pages_recommending_hosted: Vec<u32>,
+    #[pyo3(get)]
+    pub ocr_reasons_by_page: Vec<PyPageOcrReasons>,
+    #[pyo3(get)]
+    pub pages_with_tables: Vec<u32>,
+    #[pyo3(get)]
+    pub pages_with_columns: Vec<u32>,
+    #[pyo3(get)]
+    pub is_complex: bool,
+    #[pyo3(get)]
+    pub processing_time_ms: u64,
+    #[pyo3(get)]
+    pub render_time_ms: u64,
+    #[pyo3(get)]
+    pub ocr_time_ms: u64,
+}
+
+#[pymethods]
+impl PyOcrPdfResult {
+    fn __repr__(&self) -> String {
+        format!(
+            "OcrPdfResult(pages={}, routed_to_ocr={:?}, recommending_hosted={:?})",
+            self.page_count, self.pages_routed_to_ocr, self.pages_recommending_hosted
         )
     }
 }
@@ -106,6 +297,9 @@ pub struct PyRegionText {
     /// True when the text should not be trusted (empty, GID fonts, garbage, encoding issues).
     #[pyo3(get)]
     pub needs_ocr: bool,
+    /// Machine-readable OCR reason when the cause is known.
+    #[pyo3(get)]
+    pub ocr_reason: Option<String>,
 }
 
 #[pymethods]
@@ -160,6 +354,9 @@ pub struct PyPageMarkdown {
     /// encoding issues, garbage text, or empty extraction).
     #[pyo3(get)]
     pub needs_ocr: bool,
+    /// Machine-readable OCR reason when the cause is known.
+    #[pyo3(get)]
+    pub ocr_reason: Option<String>,
 }
 
 #[pymethods]
@@ -190,6 +387,9 @@ pub struct PyPagesExtractionResult {
     /// 1-indexed pages that need OCR (scanned/image-based or unreliable text).
     #[pyo3(get)]
     pub pages_needing_ocr: Vec<u32>,
+    /// Machine-readable OCR reasons by 1-indexed page.
+    #[pyo3(get)]
+    pub ocr_reasons_by_page: Vec<PyPageOcrReasons>,
     /// True if any page has tables or columns.
     #[pyo3(get)]
     pub is_complex: bool,
@@ -208,31 +408,120 @@ impl PyPagesExtractionResult {
 }
 
 /// A positioned text item extracted from a PDF.
+///
+/// x/y are PDF points relative to the page's visible page box (CropBox ∩
+/// MediaBox, else MediaBox; a CropBox that does not overlap the MediaBox is
+/// ignored, and a page without a MediaBox is measured against US Letter),
+/// origin at the box's lower-left corner with y growing upward.
+/// extract_text_in_regions reads its regions relative to the same box but
+/// from its top-left corner with y growing downward; flip with the box
+/// height. Pages whose text is drawn rotated by 90° are normalized into a
+/// synthetic landscape frame before the shift, and /Rotate is not applied.
 #[pyclass(name = "TextItem")]
 #[derive(Clone)]
 pub struct PyTextItem {
     #[pyo3(get)]
     pub text: String,
+    /// Left edge, in PDF points from the visible page box's left edge.
     #[pyo3(get)]
     pub x: f32,
+    /// Baseline for text (rect bottom edge for image, link and form-field
+    /// items), in PDF points from the visible page box's bottom edge.
     #[pyo3(get)]
     pub y: f32,
     #[pyo3(get)]
     pub width: f32,
     #[pyo3(get)]
     pub height: f32,
+    /// Rotation of the run's baseline in degrees counter-clockwise from the
+    /// page's x axis, in [0, 360): 0 for ordinary horizontal text, 90 for
+    /// text reading bottom-to-top (a rotated margin stamp), 270 for
+    /// top-to-bottom, 180 for upside-down. x/y/width/height is the run's
+    /// axis-aligned box, so a vertical run is tall and thin.
+    #[pyo3(get)]
+    pub rotation: f32,
+    /// Whether the run's advance came from font metrics. False when the font
+    /// carries no width information (or an ActualText span's advance could
+    /// not be recovered): the box's extent along the baseline is then an
+    /// estimate of half an em per painted glyph (an ActualText span counts the
+    /// glyphs it covers, not its replacement text), not a measurement.
+    #[pyo3(get)]
+    pub advance_known: bool,
     #[pyo3(get)]
     pub font: String,
+    #[pyo3(get)]
+    pub font_tag: String,
     #[pyo3(get)]
     pub font_size: f32,
     #[pyo3(get)]
     pub page: u32,
+    /// Bold from the font name, the FontDescriptor's ForceBold flag, the
+    /// embedded program's bold selection, or text filled and stroked to look
+    /// heavier; with bold_from_weight also from the weight class.
+    /// bold_source says which.
     #[pyo3(get)]
     pub is_bold: bool,
     #[pyo3(get)]
     pub is_italic: bool,
+    /// The font's weight class on the 100..=900 scale (400 regular, 700
+    /// bold), from the embedded font program's OS/2 table, else the
+    /// FontDescriptor's /FontWeight, else a weight word in the font name;
+    /// None when none of them says. Independent of is_bold.
+    #[pyo3(get)]
+    pub font_weight: Option<u16>,
+    /// Where is_bold came from: "font_name", "font_flags", "weight_class"
+    /// (with bold_from_weight) or "painted", the first of them in that order
+    /// when more than one says bold. None when is_bold is False, and for
+    /// image, link and form-field items.
+    #[pyo3(get)]
+    pub bold_source: Option<String>,
+    /// Whether the font is fixed-pitch: True when the FontDescriptor's
+    /// FixedPitch flag or the embedded program's post table says so, else
+    /// measured from the width table (True when a dozen or more glyphs share
+    /// one advance, False when two differ). None when the font declares
+    /// nothing and no two advances differ but fewer than a dozen share one,
+    /// and for image, link and form-field items.
+    #[pyo3(get)]
+    pub fixed_pitch: Option<bool>,
+    /// The fill colour the run was shown with, as an sRGB (red, green, blue)
+    /// tuple of 0..255: what its glyphs are filled with in the render modes
+    /// that fill (0, 2, 4, 6). DeviceRGB is read as sRGB, DeviceGray as
+    /// three equal components and DeviceCMYK converted as the PDF
+    /// specification converts it to DeviceRGB; ICCBased spaces are read by
+    /// their component count and Indexed spaces through their palette. None
+    /// for any other colour space (Separation, DeviceN, Pattern, CalRGB,
+    /// Lab, ...), and for image, link and form-field items.
+    #[pyo3(get)]
+    pub fill_color: Option<(u8, u8, u8)>,
+    /// The stroke colour the run was shown with, read like fill_color: what
+    /// its glyph outlines are stroked with in the render modes that stroke
+    /// (1, 2, 5, 6).
+    #[pyo3(get)]
+    pub stroke_color: Option<(u8, u8, u8)>,
+    /// The text render mode (Tr) the run was shown with, 0..7: 0 fill, 1
+    /// stroke, 2 fill and stroke, 3 invisible (the mode of OCR text layers),
+    /// 4..6 as 0..2 and clip, 7 clip only. Runs in modes 3 and 7 put no
+    /// glyphs on the page. Which runs are extracted is unchanged by it. None
+    /// for image, link and form-field items.
+    #[pyo3(get)]
+    pub render_mode: Option<u8>,
+    #[pyo3(get)]
+    pub is_underline: bool,
+    #[pyo3(get)]
+    pub is_strikeout: bool,
+    /// Signed baseline offset (points) of a super/subscript glyph run from
+    /// the body baseline it is attached to; 0.0 for normal text. Positive =
+    /// raised (superscript), negative = lowered (subscript).
+    #[pyo3(get)]
+    pub baseline_shift: f32,
     #[pyo3(get)]
     pub item_type: String,
+    /// Marked Content ID from the content stream's BDC/BMC operator, None
+    /// when the text is not part of marked content. Join with the
+    /// (page, mcid) pairs from extract_structure_elements to attach
+    /// structure-tree roles (headings, paragraphs, ...) in tagged PDFs.
+    #[pyo3(get)]
+    pub mcid: Option<i64>,
 }
 
 #[pymethods]
@@ -244,6 +533,32 @@ impl PyTextItem {
             self.page,
             self.x,
             self.y,
+        )
+    }
+}
+
+/// One structure-tree element reference from a tagged PDF.
+#[pyclass(name = "StructureElement")]
+#[derive(Clone)]
+pub struct PyStructureElement {
+    /// 1-indexed page number (matches TextItem.page).
+    #[pyo3(get)]
+    pub page: u32,
+    /// Marked Content ID from the page's content stream (matches
+    /// TextItem.mcid).
+    #[pyo3(get)]
+    pub mcid: i64,
+    /// Standard structure type name ("H1".."H6", "P", "Table", "TD", ...).
+    #[pyo3(get)]
+    pub role: String,
+}
+
+#[pymethods]
+impl PyStructureElement {
+    fn __repr__(&self) -> String {
+        format!(
+            "StructureElement(page={}, mcid={}, role='{}')",
+            self.page, self.mcid, self.role
         )
     }
 }
@@ -268,17 +583,142 @@ fn to_py_result(r: crate::PdfProcessResult) -> PyPdfResult {
         page_count: r.page_count,
         processing_time_ms: r.processing_time_ms,
         pages_needing_ocr: r.pages_needing_ocr,
+        ocr_reasons_by_page: to_py_page_ocr_reasons(r.ocr_reasons_by_page),
         title: r.title,
+        author: r.author,
+        subject: r.subject,
+        keywords: r.keywords,
+        creator: r.creator,
+        producer: r.producer,
+        creation_date: r.creation_date,
+        mod_date: r.mod_date,
         confidence: r.confidence,
         is_complex_layout: r.layout.is_complex,
         pages_with_tables: r.layout.pages_with_tables,
         pages_with_columns: r.layout.pages_with_columns,
         has_encoding_issues: r.has_encoding_issues,
+        cmap_gaps: to_py_font_cmap_gaps(r.cmap_gaps),
     }
+}
+
+fn to_py_font_cmap_gaps(gaps: Vec<crate::FontCMapGaps>) -> Vec<PyFontCMapGaps> {
+    gaps.into_iter()
+        .map(|gap| PyFontCMapGaps {
+            font: gap.font,
+            codes: gap.codes,
+            interpolated: gap.interpolated,
+            unmapped: gap.unmapped,
+        })
+        .collect()
+}
+
+fn to_py_page_ocr_reasons(reasons: Vec<crate::PageOcrReasons>) -> Vec<PyPageOcrReasons> {
+    reasons
+        .into_iter()
+        .map(|reason| PyPageOcrReasons {
+            page: reason.page,
+            reasons: reason.reasons,
+        })
+        .collect()
 }
 
 fn to_py_err(e: crate::PdfError) -> PyErr {
     PyValueError::new_err(e.to_string())
+}
+
+struct PythonOcrOptions {
+    mode: String,
+    page_numbers: Option<Vec<u32>>,
+    password: Option<String>,
+    dpi: f32,
+    minimum_confidence: f32,
+    hosted_recommendation_confidence: f32,
+    model_directory: Option<String>,
+    offline: bool,
+}
+
+fn build_ocr_options(binding: PythonOcrOptions) -> PyResult<crate::vision::OcrPdfOptions> {
+    let mode = match binding.mode.trim().to_ascii_lowercase().as_str() {
+        "off" => crate::vision::OcrMode::Off,
+        "auto" => crate::vision::OcrMode::Auto,
+        "force" => crate::vision::OcrMode::Force,
+        _ => {
+            return Err(PyValueError::new_err(
+                "mode must be 'off', 'auto', or 'force'",
+            ));
+        }
+    };
+
+    let mut options = crate::vision::OcrPdfOptions::new().mode(mode);
+    options.render.dpi = binding.dpi;
+    options.ocr.minimum_confidence = binding.minimum_confidence;
+    options.hosted_recommendation_confidence = binding.hosted_recommendation_confidence;
+    if let Some(pages) = binding.page_numbers {
+        options = options.page_numbers(pages);
+    }
+    if let Some(password) = binding.password {
+        options = options.password(password);
+    }
+    if let Some(directory) = binding.model_directory {
+        options.ocr.model_directory = Some(directory.into());
+    }
+    if binding.offline {
+        options.ocr.model_downloads = crate::vision::ModelDownloadPolicy::Offline;
+    }
+    Ok(options)
+}
+
+fn page_content_source_str(source: crate::vision::PageContentSource) -> String {
+    match source {
+        crate::vision::PageContentSource::Native => "native".into(),
+        crate::vision::PageContentSource::Ocr => "ocr".into(),
+        crate::vision::PageContentSource::Fused => "fused".into(),
+    }
+}
+
+fn to_py_ocr_result(result: crate::vision::OcrPdfResult) -> PyOcrPdfResult {
+    PyOcrPdfResult {
+        markdown: result.markdown,
+        pages: result
+            .pages
+            .into_iter()
+            .map(|page| {
+                let provenance = page.provenance;
+                PyOcrPageResult {
+                    page_number: page.page_number,
+                    markdown: page.markdown,
+                    provenance: PyOcrPageProvenance {
+                        page_number: provenance.page_number,
+                        source: page_content_source_str(provenance.source),
+                        ocr_model: provenance.ocr_model.map(|model| PyOcrModelIdentity {
+                            name: model.name,
+                            revision: model.revision,
+                        }),
+                        render_dpi: provenance.render_dpi,
+                        ocr_confidence: provenance.ocr_confidence,
+                        timings: PyOcrTimings {
+                            render_ms: provenance.timings.render_ms,
+                            ocr_ms: provenance.timings.ocr_ms,
+                            assembly_ms: provenance.timings.assembly_ms,
+                        },
+                        warnings: provenance.warnings,
+                        hosted_recommended: provenance.hosted_recommended,
+                    },
+                }
+            })
+            .collect(),
+        page_count: result.page_count,
+        pages_recommended_for_ocr: result.pages_recommended_for_ocr,
+        pages_routed_to_ocr: result.pages_routed_to_ocr,
+        pages_recommending_hosted: result.pages_recommending_hosted,
+        ocr_reasons_by_page: to_py_page_ocr_reasons(result.ocr_reasons_by_page),
+        pages_with_tables: result.pages_with_tables,
+        pages_with_columns: result.pages_with_columns,
+        is_complex: result.is_complex,
+        processing_time_ms: result.processing_time_ms,
+        render_time_ms: result.render_time_ms,
+        ocr_time_ms: result.ocr_time_ms,
+    }
 }
 
 fn item_type_str(t: &ItemType) -> String {
@@ -300,11 +740,35 @@ fn convert_text_items(items: Vec<crate::TextItem>) -> Vec<PyTextItem> {
             width: item.width,
             height: item.height,
             font: item.font,
+            font_tag: item.font_tag,
             font_size: item.font_size,
             page: item.page,
             is_bold: item.is_bold,
             is_italic: item.is_italic,
+            font_weight: item.font_weight,
+            bold_source: item.bold_source.map(|source| source.as_str().to_string()),
+            fixed_pitch: item.fixed_pitch,
+            fill_color: item.fill_color.map(|[r, g, b]| (r, g, b)),
+            stroke_color: item.stroke_color.map(|[r, g, b]| (r, g, b)),
+            render_mode: item.render_mode,
+            is_underline: item.is_underline,
+            is_strikeout: item.is_strikeout,
+            rotation: item.rotation,
+            advance_known: item.advance_known,
+            baseline_shift: item.baseline_shift,
             item_type: item_type_str(&item.item_type),
+            mcid: item.mcid,
+        })
+        .collect()
+}
+
+fn convert_structure_elements(elements: Vec<crate::StructureElement>) -> Vec<PyStructureElement> {
+    elements
+        .into_iter()
+        .map(|e| PyStructureElement {
+            page: e.page,
+            mcid: e.mcid,
+            role: e.role,
         })
         .collect()
 }
@@ -350,11 +814,13 @@ fn to_py_pages_result(r: crate::PagesExtractionResult) -> PyPagesExtractionResul
                 page: p.page,
                 markdown: p.markdown,
                 needs_ocr: p.needs_ocr,
+                ocr_reason: p.ocr_reason,
             })
             .collect(),
         pages_with_tables: r.pages_with_tables,
         pages_with_columns: r.pages_with_columns,
         pages_needing_ocr: r.pages_needing_ocr,
+        ocr_reasons_by_page: to_py_page_ocr_reasons(r.ocr_reasons_by_page),
         is_complex: r.is_complex,
     }
 }
@@ -370,6 +836,7 @@ fn convert_region_results(results: Vec<crate::PageRegionResult>) -> Vec<PyPageRe
                 .map(|r| PyRegionText {
                     text: r.text,
                     needs_ocr: r.needs_ocr,
+                    ocr_reason: r.ocr_reason,
                 })
                 .collect(),
         })
@@ -404,6 +871,99 @@ fn process_pdf_bytes(data: &[u8], pages: Option<Vec<u32>>) -> PyResult<PyPdfResu
     Ok(to_py_result(result))
 }
 
+/// Process a PDF file through native extraction and selective OCR.
+///
+/// OCR defaults to ``auto`` and only initializes its external runtime and
+/// model when native quality signals route at least one page. Page numbers
+/// are 1-indexed. The GIL is released for the complete processing call.
+#[pyfunction]
+#[pyo3(signature = (
+    path,
+    *,
+    mode="auto",
+    page_numbers=None,
+    password=None,
+    dpi=150.0,
+    minimum_confidence=0.0,
+    hosted_recommendation_confidence=0.5,
+    model_directory=None,
+    offline=false
+))]
+#[allow(clippy::too_many_arguments)]
+fn process_pdf_with_ocr(
+    py: Python<'_>,
+    path: String,
+    mode: &str,
+    page_numbers: Option<Vec<u32>>,
+    password: Option<String>,
+    dpi: f32,
+    minimum_confidence: f32,
+    hosted_recommendation_confidence: f32,
+    model_directory: Option<String>,
+    offline: bool,
+) -> PyResult<PyOcrPdfResult> {
+    let options = build_ocr_options(PythonOcrOptions {
+        mode: mode.to_string(),
+        page_numbers,
+        password,
+        dpi,
+        minimum_confidence,
+        hosted_recommendation_confidence,
+        model_directory,
+        offline,
+    })?;
+    let result = py
+        .allow_threads(move || crate::vision::process_pdf_with_ocr(path, options))
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    Ok(to_py_ocr_result(result))
+}
+
+/// Process PDF bytes through native extraction and selective OCR.
+///
+/// See [`process_pdf_with_ocr`] for options and result semantics.
+#[pyfunction]
+#[pyo3(signature = (
+    data,
+    *,
+    mode="auto",
+    page_numbers=None,
+    password=None,
+    dpi=150.0,
+    minimum_confidence=0.0,
+    hosted_recommendation_confidence=0.5,
+    model_directory=None,
+    offline=false
+))]
+#[allow(clippy::too_many_arguments)]
+fn process_pdf_with_ocr_bytes(
+    py: Python<'_>,
+    data: &[u8],
+    mode: &str,
+    page_numbers: Option<Vec<u32>>,
+    password: Option<String>,
+    dpi: f32,
+    minimum_confidence: f32,
+    hosted_recommendation_confidence: f32,
+    model_directory: Option<String>,
+    offline: bool,
+) -> PyResult<PyOcrPdfResult> {
+    let options = build_ocr_options(PythonOcrOptions {
+        mode: mode.to_string(),
+        page_numbers,
+        password,
+        dpi,
+        minimum_confidence,
+        hosted_recommendation_confidence,
+        model_directory,
+        offline,
+    })?;
+    let data = data.to_vec();
+    let result = py
+        .allow_threads(move || crate::vision::process_pdf_with_ocr_mem(&data, options))
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    Ok(to_py_ocr_result(result))
+}
+
 /// Fast detection only — no text extraction or markdown.
 #[pyfunction]
 fn detect_pdf(path: &str) -> PyResult<PyPdfResult> {
@@ -423,7 +983,7 @@ fn detect_pdf_bytes(data: &[u8]) -> PyResult<PyPdfResult> {
 /// Pages in pages_needing_ocr are 0-indexed.
 #[pyfunction]
 fn classify_pdf(path: &str) -> PyResult<PyPdfClassification> {
-    let data = std::fs::read(path).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let data = crate::read_file(std::path::Path::new(path)).map_err(to_py_err)?;
     classify_pdf_bytes(&data)
 }
 
@@ -453,9 +1013,49 @@ fn extract_text_bytes(data: &[u8]) -> PyResult<String> {
 }
 
 /// Extract text with position information from a file.
+///
+/// Args:
+///     path: Path to the PDF file.
+///     pages: Optional list of 1-indexed pages (matching TextItem.page).
+///         When None (default), the whole document is returned.
+///
+///     bold_from_weight: Also read bold from the font's weight class: is_bold
+///         is then True as well when font_weight is bold_weight_threshold or
+///         more (bold_source "weight_class"), and adjacent runs are merged by
+///         that verdict, so a run the weight makes bold stays apart from its
+///         plain neighbours while runs of different weight that agree on bold
+///         merge as usual. False by default, where is_bold and item merging
+///         are unchanged.
+///
+///     bold_weight_threshold: The weight class from which bold_from_weight
+///         reads bold, 100..900; 600 (SemiBold) by default. It matters only
+///         when bold_from_weight is True, but a value outside 100..900 raises
+///         ValueError either way.
+///
+/// Returns:
+///     List of TextItem. x/y are PDF points relative to the page's visible
+///     page box (CropBox ∩ MediaBox, else MediaBox), origin at its lower-left
+///     corner with y up; extract_text_in_regions reads regions relative to
+///     the same box from its top-left corner (flip y with the box height).
 #[pyfunction]
-#[pyo3(signature = (path, pages=None))]
-fn extract_text_with_positions(path: &str, pages: Option<Vec<u32>>) -> PyResult<Vec<PyTextItem>> {
+#[pyo3(signature = (path, pages=None, bold_from_weight=false, bold_weight_threshold=DEFAULT_BOLD_WEIGHT_THRESHOLD))]
+fn extract_text_with_positions(
+    path: &str,
+    pages: Option<Vec<u32>>,
+    bold_from_weight: bool,
+    bold_weight_threshold: i64,
+) -> PyResult<Vec<PyTextItem>> {
+    // The threshold is checked whichever path the call takes.
+    position_options(bold_from_weight, bold_weight_threshold)?;
+    if bold_from_weight {
+        let data = crate::read_file(std::path::Path::new(path)).map_err(to_py_err)?;
+        return extract_text_with_positions_bytes(
+            &data,
+            pages,
+            bold_from_weight,
+            bold_weight_threshold,
+        );
+    }
     let items = match pages {
         Some(p) => {
             let page_set: HashSet<u32> = p.into_iter().collect();
@@ -466,21 +1066,144 @@ fn extract_text_with_positions(path: &str, pages: Option<Vec<u32>>) -> PyResult<
     Ok(convert_text_items(items))
 }
 
-/// Extract text with position information from bytes.
+/// The weight class `bold_from_weight` reads bold from unless told otherwise.
+const DEFAULT_BOLD_WEIGHT_THRESHOLD: i64 = 600;
+
+/// The positioned-text options the `bold_from_weight` and
+/// `bold_weight_threshold` arguments ask for; a threshold outside the
+/// 100..=900 scale is a ValueError rather than a silent clamp. The argument
+/// is taken as a wide integer so that -1 or 65536 reach this check instead
+/// of failing the conversion to the crate's `u16`.
+fn position_options(
+    bold_from_weight: bool,
+    bold_weight_threshold: i64,
+) -> PyResult<crate::PositionOptions> {
+    let threshold = u16::try_from(bold_weight_threshold)
+        .ok()
+        .filter(|threshold| (100..=900).contains(threshold))
+        .ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "bold_weight_threshold {bold_weight_threshold} is outside 100..900"
+            ))
+        })?;
+    Ok(crate::PositionOptions::new()
+        .bold_from_weight(bold_from_weight)
+        .bold_weight_threshold(threshold))
+}
+
+/// The coordinate frame of a page whose text was predominantly rotated.
+#[pyclass(name = "PageRotation")]
+#[derive(Clone)]
+pub struct PyPageRotation {
+    /// 1-indexed page number, matching TextItem.page.
+    #[pyo3(get)]
+    pub page: u32,
+    /// "ccw" when the page's runs read bottom-to-top and the frame was turned
+    /// so they read left-to-right, "cw" for runs reading top-to-bottom.
+    #[pyo3(get)]
+    pub rotation: String,
+}
+
+#[pymethods]
+impl PyPageRotation {
+    fn __repr__(&self) -> String {
+        format!(
+            "PageRotation(page={}, rotation='{}')",
+            self.page, self.rotation
+        )
+    }
+}
+
+/// Positioned text plus the frame of every page whose text was turned.
+#[pyclass(name = "PositionedText")]
+pub struct PyPositionedText {
+    #[pyo3(get)]
+    pub items: Vec<PyTextItem>,
+    /// One entry per re-based page; pages absent here are upright and their
+    /// items are in plain page coordinates.
+    #[pyo3(get)]
+    pub page_rotations: Vec<PyPageRotation>,
+}
+
+fn convert_page_rotations(
+    rotations: std::collections::HashMap<u32, crate::PageRotation>,
+) -> Vec<PyPageRotation> {
+    let mut out: Vec<PyPageRotation> = rotations
+        .into_iter()
+        .filter_map(|(page, rotation)| {
+            let rotation = match rotation {
+                crate::PageRotation::Upright => return None,
+                crate::PageRotation::Ccw => "ccw",
+                crate::PageRotation::Cw => "cw",
+            };
+            Some(PyPageRotation {
+                page,
+                rotation: rotation.to_string(),
+            })
+        })
+        .collect();
+    out.sort_by_key(|r| r.page);
+    out
+}
+
+/// Extract text with positions from a PDF file, together with the coordinate
+/// frame of every page whose text was predominantly rotated. Items on such a
+/// page are expressed in the turned frame (their dominant runs read
+/// left-to-right there); pages absent from `page_rotations` are upright.
+/// `bold_from_weight` and `bold_weight_threshold` are the options of
+/// extract_text_with_positions.
 #[pyfunction]
-#[pyo3(signature = (data, pages=None))]
+#[pyo3(signature = (path, bold_from_weight=false, bold_weight_threshold=DEFAULT_BOLD_WEIGHT_THRESHOLD))]
+fn extract_text_with_positions_and_rotations(
+    path: &str,
+    bold_from_weight: bool,
+    bold_weight_threshold: i64,
+) -> PyResult<PyPositionedText> {
+    // The threshold is checked before the file is read.
+    position_options(bold_from_weight, bold_weight_threshold)?;
+    let data = crate::read_file(std::path::Path::new(path)).map_err(to_py_err)?;
+    extract_text_with_positions_and_rotations_bytes(&data, bold_from_weight, bold_weight_threshold)
+}
+
+/// Extract text with positions from bytes, together with the coordinate frame
+/// of every page whose text was predominantly rotated.
+#[pyfunction]
+#[pyo3(signature = (data, bold_from_weight=false, bold_weight_threshold=DEFAULT_BOLD_WEIGHT_THRESHOLD))]
+fn extract_text_with_positions_and_rotations_bytes(
+    data: &[u8],
+    bold_from_weight: bool,
+    bold_weight_threshold: i64,
+) -> PyResult<PyPositionedText> {
+    let (items, rotations) = crate::extract_text_with_positions_and_rotations_mem_with_options(
+        data,
+        None,
+        position_options(bold_from_weight, bold_weight_threshold)?,
+    )
+    .map_err(to_py_err)?;
+    Ok(PyPositionedText {
+        items: convert_text_items(items),
+        page_rotations: convert_page_rotations(rotations),
+    })
+}
+
+/// Extract text with position information from bytes.
+///
+/// See extract_text_with_positions for the arguments and coordinate frame.
+#[pyfunction]
+#[pyo3(signature = (data, pages=None, bold_from_weight=false, bold_weight_threshold=DEFAULT_BOLD_WEIGHT_THRESHOLD))]
 fn extract_text_with_positions_bytes(
     data: &[u8],
     pages: Option<Vec<u32>>,
+    bold_from_weight: bool,
+    bold_weight_threshold: i64,
 ) -> PyResult<Vec<PyTextItem>> {
-    let items = match pages {
-        Some(p) => {
-            let page_set: HashSet<u32> = p.into_iter().collect();
-            crate::extractor::extract_text_with_positions_mem_pages(data, Some(&page_set))
-                .map_err(to_py_err)?
-        }
-        None => crate::extractor::extract_text_with_positions_mem(data).map_err(to_py_err)?,
-    };
+    let page_set: Option<HashSet<u32>> = pages.map(|p| p.into_iter().collect());
+    let items = crate::extract_text_with_positions_mem_with_options(
+        data,
+        page_set.as_ref(),
+        position_options(bold_from_weight, bold_weight_threshold)?,
+    )
+    .map_err(to_py_err)?;
     Ok(convert_text_items(items))
 }
 
@@ -489,17 +1212,33 @@ fn extract_text_with_positions_bytes(
 /// Args:
 ///     path: Path to the PDF file.
 ///     page_regions: List of (page_0indexed, [[x1, y1, x2, y2], ...]) tuples.
-///         Coordinates are PDF points with top-left origin.
+///         Coordinates are PDF points with top-left origin, relative to the
+///         visible page box (CropBox ∩ MediaBox, else MediaBox) — the same
+///         box extract_text_with_positions reports items in, flipped to a
+///         top-left origin (y_top = box_height - y).
+///
+///     bold_from_weight: The option of extract_text_with_positions: read bold
+///         from the font's weight class too, so a run the weight makes bold
+///         is its own item while a region's lines are assembled. False by
+///         default.
+///
+///     bold_weight_threshold: The weight class bold_from_weight reads bold
+///         from, 100..900; 600 by default.
 ///
 /// Returns:
 ///     List of PageRegionTexts with per-region text and needs_ocr flag.
 #[pyfunction]
+#[pyo3(signature = (path, page_regions, bold_from_weight=false, bold_weight_threshold=DEFAULT_BOLD_WEIGHT_THRESHOLD))]
 fn extract_text_in_regions(
     path: &str,
     page_regions: Vec<(u32, Vec<Vec<f64>>)>,
+    bold_from_weight: bool,
+    bold_weight_threshold: i64,
 ) -> PyResult<Vec<PyPageRegionTexts>> {
-    let data = std::fs::read(path).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    extract_text_in_regions_bytes(&data, page_regions)
+    // The threshold is checked before the file is read.
+    position_options(bold_from_weight, bold_weight_threshold)?;
+    let data = crate::read_file(std::path::Path::new(path)).map_err(to_py_err)?;
+    extract_text_in_regions_bytes(&data, page_regions, bold_from_weight, bold_weight_threshold)
 }
 
 /// Extract text within bounding-box regions from PDF bytes.
@@ -507,17 +1246,32 @@ fn extract_text_in_regions(
 /// Args:
 ///     data: PDF file contents as bytes.
 ///     page_regions: List of (page_0indexed, [[x1, y1, x2, y2], ...]) tuples.
-///         Coordinates are PDF points with top-left origin.
+///         Coordinates are PDF points with top-left origin, relative to the
+///         visible page box (CropBox ∩ MediaBox, else MediaBox) — the same
+///         box extract_text_with_positions reports items in, flipped to a
+///         top-left origin (y_top = box_height - y).
+///
+///     bold_from_weight: See extract_text_in_regions.
+///
+///     bold_weight_threshold: See extract_text_in_regions.
 ///
 /// Returns:
 ///     List of PageRegionTexts with per-region text and needs_ocr flag.
 #[pyfunction]
+#[pyo3(signature = (data, page_regions, bold_from_weight=false, bold_weight_threshold=DEFAULT_BOLD_WEIGHT_THRESHOLD))]
 fn extract_text_in_regions_bytes(
     data: &[u8],
     page_regions: Vec<(u32, Vec<Vec<f64>>)>,
+    bold_from_weight: bool,
+    bold_weight_threshold: i64,
 ) -> PyResult<Vec<PyPageRegionTexts>> {
     let regions = parse_page_regions(page_regions)?;
-    let results = crate::extract_text_in_regions_mem(data, &regions).map_err(to_py_err)?;
+    let results = crate::extract_text_in_regions_mem_with_options(
+        data,
+        &regions,
+        position_options(bold_from_weight, bold_weight_threshold)?,
+    )
+    .map_err(to_py_err)?;
     Ok(convert_region_results(results))
 }
 
@@ -559,18 +1313,70 @@ fn extract_pages_markdown_bytes(
     Ok(to_py_pages_result(result))
 }
 
+/// Extract structure-tree element references from a tagged PDF file.
+///
+/// Parses the document's structure tree (when present) and returns one
+/// entry per marked-content reference, resolved to its 1-indexed page,
+/// MCID, and structure type name ("H1".."H6", "P", "Table", ...). Returns
+/// an empty list when the PDF is not tagged.
+///
+/// Join (page, mcid) against the page/mcid attributes from
+/// [`extract_text_with_positions`] to attach heading levels and other
+/// semantic roles to extracted text.
+///
+/// Args:
+///     path: Path to the PDF file.
+///     pages: Optional list of 1-indexed pages (matching TextItem.page).
+///         When None (default), the whole document is returned.
+///
+/// Returns:
+///     List of StructureElement sorted by (page, mcid).
+#[pyfunction]
+#[pyo3(signature = (path, pages=None))]
+fn extract_structure_elements(
+    path: &str,
+    pages: Option<Vec<u32>>,
+) -> PyResult<Vec<PyStructureElement>> {
+    let elements = crate::extract_structure_elements(path, pages.as_deref()).map_err(to_py_err)?;
+    Ok(convert_structure_elements(elements))
+}
+
+/// Extract structure-tree element references from tagged PDF bytes.
+///
+/// See [`extract_structure_elements`] for details.
+#[pyfunction]
+#[pyo3(signature = (data, pages=None))]
+fn extract_structure_elements_bytes(
+    data: &[u8],
+    pages: Option<Vec<u32>>,
+) -> PyResult<Vec<PyStructureElement>> {
+    let elements =
+        crate::extract_structure_elements_mem(data, pages.as_deref()).map_err(to_py_err)?;
+    Ok(convert_structure_elements(elements))
+}
+
 /// Python module definition.
 #[pymodule]
 fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPdfResult>()?;
+    m.add_class::<PyPageOcrReasons>()?;
+    m.add_class::<PyFontCMapGaps>()?;
+    m.add_class::<PyOcrModelIdentity>()?;
+    m.add_class::<PyOcrTimings>()?;
+    m.add_class::<PyOcrPageProvenance>()?;
+    m.add_class::<PyOcrPageResult>()?;
+    m.add_class::<PyOcrPdfResult>()?;
     m.add_class::<PyPdfClassification>()?;
     m.add_class::<PyTextItem>()?;
+    m.add_class::<PyStructureElement>()?;
     m.add_class::<PyRegionText>()?;
     m.add_class::<PyPageRegionTexts>()?;
     m.add_class::<PyPageMarkdown>()?;
     m.add_class::<PyPagesExtractionResult>()?;
     m.add_function(wrap_pyfunction!(process_pdf, m)?)?;
     m.add_function(wrap_pyfunction!(process_pdf_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(process_pdf_with_ocr, m)?)?;
+    m.add_function(wrap_pyfunction!(process_pdf_with_ocr_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(detect_pdf, m)?)?;
     m.add_function(wrap_pyfunction!(detect_pdf_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(classify_pdf, m)?)?;
@@ -579,6 +1385,18 @@ fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_text_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(extract_text_with_positions, m)?)?;
     m.add_function(wrap_pyfunction!(extract_text_with_positions_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        extract_text_with_positions_and_rotations,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        extract_text_with_positions_and_rotations_bytes,
+        m
+    )?)?;
+    m.add_class::<PyPageRotation>()?;
+    m.add_class::<PyPositionedText>()?;
+    m.add_function(wrap_pyfunction!(extract_structure_elements, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_structure_elements_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(extract_text_in_regions, m)?)?;
     m.add_function(wrap_pyfunction!(extract_text_in_regions_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(extract_pages_markdown, m)?)?;

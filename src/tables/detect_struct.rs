@@ -123,9 +123,7 @@ fn align_positions_to_columns(cell_xs: &[f32], columns: &[f32]) -> Vec<usize> {
     let mut dp = vec![vec![f32::INFINITY; columns.len() + 1]; cell_xs.len() + 1];
     let mut take = vec![vec![false; columns.len() + 1]; cell_xs.len() + 1];
 
-    for value in &mut dp[0] {
-        *value = 0.0;
-    }
+    dp[0].fill(0.0);
 
     for i in 1..=cell_xs.len() {
         for j in 1..=columns.len() {
@@ -463,23 +461,32 @@ pub fn detect_tables_from_struct_tree(
                     matched_cells += 1;
                 }
 
-                // Sort by Y (descending = top-to-bottom) then X
-                cell_items.sort_by(|a, b| {
-                    b.1.y
-                        .partial_cmp(&a.1.y)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then(
-                            a.1.x
-                                .partial_cmp(&b.1.x)
-                                .unwrap_or(std::cmp::Ordering::Equal),
-                        )
-                });
+                // Sort by Y (descending = top-to-bottom) then X in reading
+                // direction: ascending, or right-to-left in baseline bands
+                // for RTL cells (embedded LTR phrases keep screen order).
+                // Direction comes from strong RTL letters only — a digit-only
+                // cell split across items must not have its number reversed.
+                let rtl = crate::text_utils::is_rtl_text(cell_items.iter().map(|(_, i)| &i.text));
+                if rtl {
+                    crate::text_utils::sort_rtl_cell_items(&mut cell_items, |(_, i)| *i);
+                } else {
+                    cell_items.sort_by(|a, b| {
+                        b.1.line_y()
+                            .partial_cmp(&a.1.line_y())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then(
+                                a.1.x
+                                    .partial_cmp(&b.1.x)
+                                    .unwrap_or(std::cmp::Ordering::Equal),
+                            )
+                    });
+                }
 
-                let text: String = cell_items
-                    .iter()
-                    .map(|(_, item)| item.text.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                let mut text = String::new();
+                let mut last = None;
+                for (_, item) in &cell_items {
+                    super::cell_text::push_cell_item(&mut text, &mut last, item, &item.text);
+                }
 
                 let item_indices = cell_items.iter().map(|(idx, _)| *idx).collect::<Vec<_>>();
                 let x = cell_items.iter().map(|(_, item)| item.x).reduce(f32::min);
@@ -582,12 +589,25 @@ mod tests {
             width: text.len() as f32 * 5.0,
             height: 10.0,
             font: "Test".to_string(),
+            font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: 10.0,
             page,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
+            is_underline: false,
+            is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid,
+            baseline_shift: 0.0,
         }
     }
 

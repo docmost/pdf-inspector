@@ -4,8 +4,11 @@ build-backend = "maturin"
 
 [project]
 name = "pdf-inspector"
-version = "0.1.0"
+# Keep package versions in sync with `python3 scripts/version.py <version>`.
+# CI publishes automatically when the synchronized change lands on main.
+version = "1.25.2"
 description = "Fast PDF inspection, classification, and text extraction with smart scanned vs text-based detection"
+readme = "docs/python.md"
 license = { text = "MIT" }
 requires-python = ">=3.8"
 classifiers = [
@@ -16,6 +19,11 @@ classifiers = [
     "Operating System :: OS Independent",
     "Topic :: Text Processing",
 ]
+
+[project.urls]
+Homepage = "https://github.com/firecrawl/pdf-inspector"
+Repository = "https://github.com/firecrawl/pdf-inspector"
+Documentation = "https://github.com/firecrawl/pdf-inspector/blob/main/docs/python.md"
 
 [tool.maturin]
 features = ["python"]

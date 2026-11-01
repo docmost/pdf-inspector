@@ -9,6 +9,8 @@
 pub(crate) mod analysis;
 mod classify;
 mod convert;
+mod furniture;
+mod heading;
 mod postprocess;
 mod preprocess;
 
@@ -16,12 +18,147 @@ pub use convert::to_markdown_from_lines;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::extractor::group_into_lines_with_thresholds;
+use crate::extractor::images::PDF_IMAGE_SCHEME;
 use crate::types::{PdfLine, PdfRect, TextItem};
 
 use analysis::calculate_font_stats_from_items;
-use classify::{format_list_item, is_code_like, is_list_item};
-use convert::{merge_continuation_tables, to_markdown_from_lines_with_tables_and_images};
+use classify::{format_list_item, is_caption_line, is_code_like, is_list_item};
+use convert::{
+    merge_continuation_tables, to_markdown_from_lines_with_tables_and_images, ChartProseOrder,
+    PositionedMarkdown,
+};
+
+const CHART_REGION_PAD: f32 = 20.0;
+const CHART_SEPARATOR_PAD: f32 = 8.0;
+
+fn is_chart_adjacent_label(item: &TextItem, region: (f32, f32, f32, f32)) -> bool {
+    let text = item.text.trim();
+    let is_bare_bullet = matches!(text, "•" | "●" | "○" | "◦" | "-" | "*");
+    if text.is_empty() || is_list_item(text) || is_bare_bullet {
+        return false;
+    }
+
+    let (x0, y0, x1, y1) = region;
+    let (left, right) = (x0.min(x1), x0.max(x1));
+    let (bottom, top) = (y0.min(y1), y0.max(y1));
+    let item_left = item.x.min(item.x + item.width);
+    let item_right = item.x.max(item.x + item.width);
+    let item_width = (item_right - item_left).max(1.0);
+    let chart_width = (right - left).max(1.0);
+    let horizontal_overlap = (item_right.min(right) - item_left.max(left)).max(0.0);
+    let mostly_inside_chart_width = horizontal_overlap >= item_width * 0.8;
+    let vertical_gap = if item.y < bottom {
+        bottom - item.y
+    } else if item.y > top {
+        item.y - top
+    } else {
+        0.0
+    };
+    let is_caption = is_caption_line(text);
+    let em = item.cross_extent().max(item.font_size).max(1.0);
+    let compact_label = item_width <= em * 18.5;
+    let category_band = (em * 1.85).clamp(6.0, CHART_REGION_PAD);
+    let close_to_chart_edge = if is_caption {
+        vertical_gap <= CHART_REGION_PAD
+    } else {
+        vertical_gap <= category_band
+    };
+    let category_sized = item_width <= chart_width * 0.75;
+
+    vertical_gap <= CHART_REGION_PAD
+        && (compact_label
+            || is_caption
+            || (mostly_inside_chart_width && close_to_chart_edge && category_sized))
+}
+
+pub(crate) fn item_is_in_chart_region(item: &TextItem, regions: &[(f32, f32, f32, f32)]) -> bool {
+    regions.iter().any(|&(x0, y0, x1, y1)| {
+        let cx = item.x + item.width / 2.0;
+        let within_padded_x = cx >= x0 - CHART_REGION_PAD && cx <= x1 + CHART_REGION_PAD;
+        let within_core_y = item.y >= y0 && item.y <= y1;
+        let within_padded_y = item.y >= y0 - CHART_REGION_PAD
+            && item.y <= y1 + CHART_REGION_PAD
+            && is_chart_adjacent_label(item, (x0, y0, x1, y1));
+        within_padded_x && (within_core_y || within_padded_y)
+    })
+}
+
+fn items_outside_chart_regions(
+    items: &[TextItem],
+    regions: &[(f32, f32, f32, f32)],
+) -> Vec<TextItem> {
+    items
+        .iter()
+        .filter(|item| !item_is_in_chart_region(item, regions))
+        .cloned()
+        .collect()
+}
+
+pub(crate) fn merge_chart_regions(
+    regions: impl IntoIterator<Item = (f32, f32, f32, f32)>,
+) -> Vec<(f32, f32, f32, f32)> {
+    const MERGE_TOLERANCE: f32 = 3.0;
+
+    let mut merged: Vec<(f32, f32, f32, f32)> = Vec::new();
+    for (x0, y0, x1, y1) in regions {
+        let mut current = (x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1));
+        let mut index = 0;
+        while index < merged.len() {
+            let candidate = merged[index];
+            let overlaps = current.2 + MERGE_TOLERANCE >= candidate.0
+                && candidate.2 + MERGE_TOLERANCE >= current.0
+                && current.3 + MERGE_TOLERANCE >= candidate.1
+                && candidate.3 + MERGE_TOLERANCE >= current.1;
+            if overlaps {
+                current = (
+                    current.0.min(candidate.0),
+                    current.1.min(candidate.1),
+                    current.2.max(candidate.2),
+                    current.3.max(candidate.3),
+                );
+                merged.swap_remove(index);
+            } else {
+                index += 1;
+            }
+        }
+        merged.push(current);
+    }
+    merged
+}
+
+pub(crate) type PageChartRegions = HashMap<u32, Vec<(f32, f32, f32, f32)>>;
+
+/// Compute the chart masks used by both layout analysis and Markdown output.
+///
+/// Keeping the rect-backed and dense-line heuristics behind one entry point
+/// ensures metadata and extraction cannot drift when either detector changes.
+pub(crate) fn chart_regions_by_page(
+    items: &[TextItem],
+    rects: &[PdfRect],
+    lines: &[PdfLine],
+) -> PageChartRegions {
+    let mut page_items: HashMap<u32, Vec<TextItem>> = HashMap::new();
+    for item in items.iter().filter(|item| {
+        matches!(
+            &item.item_type,
+            crate::types::ItemType::Text | crate::types::ItemType::FormField
+        )
+    }) {
+        page_items.entry(item.page).or_default().push(item.clone());
+    }
+
+    page_items
+        .into_iter()
+        .filter_map(|(page, items)| {
+            let rect_regions = crate::tables::detect_chart_regions(&items, rects, page);
+            let line_regions = crate::tables::detect_dense_line_chart_regions(lines, rects, page)
+                .into_iter()
+                .filter(|&region| chart_region_separates_prose_columns(&items, region));
+            let regions = merge_chart_regions(rect_regions.into_iter().chain(line_regions));
+            (!regions.is_empty()).then_some((page, regions))
+        })
+        .collect()
+}
 
 /// Detect side-by-side table layout by finding a significant X-position gap.
 ///
@@ -172,6 +309,613 @@ pub(crate) fn split_side_by_side(items: &[TextItem]) -> Vec<(f32, f32)> {
     vec![(x_min, best_split), (best_split, x_max)]
 }
 
+/// Detect two short prose columns on a chart page from repeated left anchors.
+///
+/// Chart masking can leave fewer than 20 lines per column, while justified text
+/// can reduce the physical gutter below the projection detector's 8pt minimum.
+/// Repeated prose left edges remain reliable in that case. The caller scopes
+/// this signal to pages with a confirmed chart region.
+fn chart_page_prose_column_split(items: &[TextItem]) -> Option<f32> {
+    const X_TOLERANCE: f32 = 12.0;
+    const MIN_LINES_PER_COLUMN: usize = 6;
+    const MIN_ANCHOR_SEPARATION: f32 = 120.0;
+    const MIN_VERTICAL_SPAN: f32 = 60.0;
+
+    let mut prose: Vec<&TextItem> = items
+        .iter()
+        .filter(|item| {
+            let words = item.text.split_whitespace().count();
+            let chars = item.text.chars().count().max(1);
+            let alphabetic = item.text.chars().filter(|c| c.is_alphabetic()).count();
+            words >= 4 && item.width >= 80.0 && alphabetic * 2 >= chars
+        })
+        .collect();
+    if prose.len() < MIN_LINES_PER_COLUMN * 2 {
+        return None;
+    }
+    prose.sort_by(|a, b| a.x.total_cmp(&b.x));
+
+    let mut clusters: Vec<(f32, Vec<&TextItem>)> = Vec::new();
+    for item in prose {
+        if let Some((anchor, members)) = clusters
+            .iter_mut()
+            .find(|(anchor, _)| (item.x - *anchor).abs() <= X_TOLERANCE)
+        {
+            members.push(item);
+            *anchor = members.iter().map(|member| member.x).sum::<f32>() / members.len() as f32;
+        } else {
+            clusters.push((item.x, vec![item]));
+        }
+    }
+
+    let mut dominant: Vec<(f32, Vec<&TextItem>)> = clusters
+        .into_iter()
+        .filter(|(_, members)| members.len() >= MIN_LINES_PER_COLUMN)
+        .collect();
+    if dominant.len() != 2 {
+        return None;
+    }
+    dominant.sort_by(|a, b| a.0.total_cmp(&b.0));
+    if dominant[1].0 - dominant[0].0 < MIN_ANCHOR_SEPARATION {
+        return None;
+    }
+
+    let vertical_range = |members: &[&TextItem]| {
+        let y_min = members
+            .iter()
+            .map(|item| item.y)
+            .fold(f32::INFINITY, f32::min);
+        let y_max = members
+            .iter()
+            .map(|item| item.y)
+            .fold(f32::NEG_INFINITY, f32::max);
+        (y_min, y_max)
+    };
+    let left_y = vertical_range(&dominant[0].1);
+    let right_y = vertical_range(&dominant[1].1);
+    if left_y.1 - left_y.0 < MIN_VERTICAL_SPAN || right_y.1 - right_y.0 < MIN_VERTICAL_SPAN {
+        return None;
+    }
+    let overlap = (left_y.1.min(right_y.1) - left_y.0.max(right_y.0)).max(0.0);
+    let shorter_span = (left_y.1 - left_y.0).min(right_y.1 - right_y.0);
+    if overlap < shorter_span * 0.4 {
+        return None;
+    }
+
+    Some((dominant[0].0 + dominant[1].0) / 2.0)
+}
+
+/// True when a chart crosses the inferred prose gutter by enough to act as a
+/// page-wide separator. A chart confined to one column must stay in that
+/// column's local reading order instead of reordering the entire page.
+fn chart_spans_prose_split(region: (f32, f32, f32, f32), split_x: f32) -> bool {
+    const MIN_CHART_WIDTH_PER_SIDE: f32 = 40.0;
+
+    let (x0, _, x1, _) = region;
+    let left = x0.min(x1);
+    let right = x0.max(x1);
+    split_x - left >= MIN_CHART_WIDTH_PER_SIDE && right - split_x >= MIN_CHART_WIDTH_PER_SIDE
+}
+
+pub(crate) fn chart_region_separates_prose_columns(
+    items: &[TextItem],
+    region: (f32, f32, f32, f32),
+) -> bool {
+    let outside = items_outside_chart_regions(items, &[region]);
+    chart_page_prose_column_split(&outside)
+        .is_some_and(|split_x| chart_spans_prose_split(region, split_x))
+}
+
+/// True when adjacent physical rows form an unterminated, lowercase prose
+/// continuation in the same projected column.
+fn is_cross_row_prose_continuation(previous: &str, current: &str) -> bool {
+    let previous = previous.trim();
+    let current = current.trim();
+    if previous.is_empty() || current.is_empty() {
+        return false;
+    }
+
+    let previous_without_closers = previous.trim_end_matches(['"', '\'', '”', ')', ']']);
+    let previous_is_open = previous_without_closers
+        .chars()
+        .next_back()
+        .is_some_and(|ch| !matches!(ch, '.' | '!' | '?' | ':' | ';'));
+    let current_starts_as_continuation = current
+        .chars()
+        .find(|ch| ch.is_alphabetic())
+        .is_some_and(|ch| ch.is_lowercase());
+
+    previous_is_open && current_starts_as_continuation
+}
+
+/// Section-numbered headings embedded in a candidate are strong evidence that
+/// a heuristic grid has captured page prose rather than a real table.
+fn looks_like_numbered_section_heading(text: &str) -> bool {
+    let Some((prefix, title)) = text.trim().split_once(char::is_whitespace) else {
+        return false;
+    };
+    let prefix = prefix.trim_end_matches('.');
+    let mut group_count = 0;
+    for group in prefix.split('.') {
+        if group.is_empty() || group.len() > 3 || !group.chars().all(|ch| ch.is_ascii_digit()) {
+            return false;
+        }
+        group_count += 1;
+    }
+    let title = title.trim();
+    (1..=4).contains(&group_count)
+        && title.split_whitespace().count() >= 3
+        && title
+            .chars()
+            .find(|ch| ch.is_alphabetic())
+            .is_some_and(|ch| ch.is_uppercase())
+}
+
+fn merged_retry_skips_body_font(detected_columns: bool, has_chart_regions: bool) -> bool {
+    detected_columns && !has_chart_regions
+}
+
+/// Identity of a piece of page furniture: the same trimmed text drawn at the
+/// same position (quantized to 0.5pt) — page numbers excluded by construction
+/// because their text differs per page.
+type FurnitureKey = (String, i32, i32);
+
+fn furniture_key(item: &TextItem) -> FurnitureKey {
+    (
+        item.text.trim().to_string(),
+        (item.x * 2.0).round() as i32,
+        (item.y * 2.0).round() as i32,
+    )
+}
+
+/// Minimum distinct pages an identical (text, position) must appear on before
+/// it counts as a running header/footer rather than coincidence.
+const RUNNING_FURNITURE_MIN_PAGES: usize = 3;
+
+/// Fraction of each page's vertical content extent, at the top and at the
+/// bottom, where running furniture may live. Repetition alone is not enough:
+/// a form template repeated per record carries identical labels at identical
+/// mid-page coordinates on every page, and those are real table cells. What
+/// makes a header/footer is repetition *at the page edge*.
+const RUNNING_FURNITURE_BAND: f32 = 0.2;
+
+/// Collect the keys of items that repeat verbatim at the same position on at
+/// least [`RUNNING_FURNITURE_MIN_PAGES`] distinct pages, restricted to the
+/// top/bottom [`RUNNING_FURNITURE_BAND`] of each page's content extent —
+/// running headers and footers. Single- and two-page documents produce an
+/// empty set.
+fn running_furniture_keys(items: &[TextItem]) -> HashSet<FurnitureKey> {
+    // Vertical content extent per page, so the edge bands adapt to the
+    // document's real margins instead of assuming a media box.
+    let mut page_extent: HashMap<u32, (f32, f32)> = HashMap::new();
+    for item in items {
+        if item.text.trim().is_empty() {
+            continue;
+        }
+        let entry = page_extent.entry(item.page).or_insert((item.y, item.y));
+        entry.0 = entry.0.min(item.y);
+        entry.1 = entry.1.max(item.y);
+    }
+
+    let mut pages_by_key: HashMap<FurnitureKey, HashSet<u32>> = HashMap::new();
+    for item in items {
+        if item.text.trim().is_empty() {
+            continue;
+        }
+        let Some(&(min_y, max_y)) = page_extent.get(&item.page) else {
+            continue;
+        };
+        // A page whose text has no vertical span gives no evidence of where
+        // its edges are — without this guard, a zero band would classify its
+        // every item as edge furniture.
+        let extent = max_y - min_y;
+        if extent <= 0.0 {
+            continue;
+        }
+        let band = extent * RUNNING_FURNITURE_BAND;
+        if item.y > min_y + band && item.y < max_y - band {
+            continue; // mid-page: never furniture, however often it repeats
+        }
+        pages_by_key
+            .entry(furniture_key(item))
+            .or_default()
+            .insert(item.page);
+    }
+    pages_by_key
+        .into_iter()
+        .filter(|(_, pages)| pages.len() >= RUNNING_FURNITURE_MIN_PAGES)
+        .map(|(key, _)| key)
+        .collect()
+}
+
+/// Reject a heuristic table whose items are almost entirely running
+/// headers/footers. A wrapped document title repeated at the bottom of every
+/// page aligns well enough to read as a grid, but it is page furniture, not
+/// data — vetoing the table lets the text flow as prose instead. Real tables
+/// carry per-page content, so even a repeated *header row* stays under the
+/// threshold once its body rows differ.
+fn is_running_furniture_table(
+    detection_items: &[TextItem],
+    table: &crate::tables::Table,
+    running: &HashSet<FurnitureKey>,
+) -> bool {
+    if running.is_empty() {
+        return false;
+    }
+    let mut total = 0usize;
+    let mut furniture = 0usize;
+    for &idx in &table.item_indices {
+        let Some(item) = detection_items.get(idx) else {
+            continue;
+        };
+        if item.text.trim().is_empty() {
+            continue;
+        }
+        total += 1;
+        if running.contains(&furniture_key(item)) {
+            furniture += 1;
+        }
+    }
+    total > 0 && (furniture as f32) >= (total as f32) * 0.8
+}
+
+/// Reject a heuristic table only when its cells are overwhelmingly parallel
+/// prose fragments. This is deliberately narrower than disabling body-font
+/// detection for the whole page: numeric, compact, headed, and otherwise
+/// table-shaped candidates remain eligible on chart pages.
+fn is_parallel_prose_table(table: &crate::tables::Table) -> bool {
+    if table.kind != crate::tables::TableKind::Data
+        || !(2..=6).contains(&table.columns.len())
+        || table.rows.len() < 3
+    {
+        return false;
+    }
+
+    let mut non_empty = 0;
+    let mut long_prose = 0;
+    let mut rows_with_parallel_prose = 0;
+    let mut occupied_rows = 0;
+    let has_numbered_section_heading = table
+        .cells
+        .iter()
+        .flatten()
+        .any(|cell| looks_like_numbered_section_heading(cell));
+    let has_compact_header = table
+        .cells
+        .iter()
+        .find(|row| row.iter().any(|cell| !cell.trim().is_empty()))
+        .is_some_and(|row| {
+            let filled: Vec<&String> = row.iter().filter(|cell| !cell.trim().is_empty()).collect();
+            filled.len() >= 2
+                && filled.iter().all(|cell| {
+                    cell.split_whitespace().count() <= 4 && cell.trim().chars().count() <= 28
+                })
+        });
+
+    for row in &table.cells {
+        let mut row_long_prose = 0;
+        let mut row_non_empty = 0;
+        for cell in row {
+            let text = cell.trim();
+            if text.is_empty() {
+                continue;
+            }
+            non_empty += 1;
+            row_non_empty += 1;
+            let chars = text.chars().filter(|ch| !ch.is_whitespace()).count();
+            let alphabetic = text.chars().filter(|ch| ch.is_alphabetic()).count();
+            let words = text.split_whitespace().count();
+            if chars >= 28 && words >= 5 && alphabetic * 5 >= chars * 3 {
+                long_prose += 1;
+                row_long_prose += 1;
+            }
+        }
+        if row_long_prose >= 2 {
+            rows_with_parallel_prose += 1;
+        }
+        if row_non_empty > 0 {
+            occupied_rows += 1;
+        }
+    }
+
+    // A lowercase cell is not continuation evidence by itself: legitimate
+    // headerless tables often use sentence fragments as row values. Require a
+    // direct physical-row transition from an unterminated cell in the same
+    // column. This is the shape produced when independent prose columns are
+    // accidentally projected onto one table grid.
+    // Prose flowing through a grid is often interrupted by empty cells
+    // (the interleaved fragment occupies the other column on that row), so
+    // each cell is compared against the last non-empty cell above it in the
+    // same column, not just the immediately preceding row.
+    let mut continuation_fragments = 0;
+    let mut continuation_columns = vec![false; table.columns.len()];
+    for (column, has_continuation) in continuation_columns.iter_mut().enumerate() {
+        let mut previous_non_empty: Option<&str> = None;
+        for row in &table.cells {
+            let current = row.get(column).map(String::as_str).unwrap_or("");
+            if current.trim().is_empty() {
+                continue;
+            }
+            if let Some(previous) = previous_non_empty {
+                if is_cross_row_prose_continuation(previous, current) {
+                    continuation_fragments += 1;
+                    *has_continuation = true;
+                }
+            }
+            previous_non_empty = Some(current);
+        }
+    }
+
+    // A compact header row is evidence for a real table — unless cross-row
+    // prose continuations outnumber the rows, which no genuine table
+    // produces: the "header" is then just two short line fragments at the
+    // top of parallel prose columns.
+    let header_blocks = has_compact_header && continuation_fragments <= table.cells.len();
+
+    // Citation blocks over-fragmented into wide grids: nearly every cell is
+    // a bare word and the rows read on as prose. Real wide tables carry
+    // numbers, units, or multi-word values.
+    let single_token_alpha = table
+        .cells
+        .iter()
+        .flatten()
+        .filter(|cell| {
+            let t = cell.trim();
+            !t.is_empty()
+                && t.split_whitespace().count() == 1
+                && t.chars().filter(|c| c.is_alphabetic()).count() * 2 >= t.chars().count().max(1)
+        })
+        .count();
+    // Categorical grids repeat a small value vocabulary down their
+    // columns; flowing text almost never repeats a cell. A fully
+    // populated word grid is only rejected when its cells are almost all
+    // distinct AND the continuations strongly outnumber the rows.
+    let distinct_cells: std::collections::HashSet<String> = table
+        .cells
+        .iter()
+        .flatten()
+        .map(|c| c.trim().to_ascii_lowercase())
+        .filter(|c| !c.is_empty())
+        .collect();
+    let mostly_distinct = distinct_cells.len() * 4 >= non_empty * 3;
+    let word_fragment_grid = !header_blocks
+        && table.columns.len() >= 4
+        && non_empty >= 8
+        && (non_empty < table.cells.len() * table.columns.len()
+            || (mostly_distinct && continuation_fragments > table.cells.len() * 2))
+        && single_token_alpha * 4 >= non_empty * 3
+        && continuation_fragments >= 4
+        && continuation_columns.iter().filter(|&&value| value).count() >= 2;
+
+    // Numbered lists projected onto a two-column grid: the first column is
+    // list markers ("1.", "2)", …), the second the item text. Rendering
+    // these as tables loses the list; the page flow keeps it.
+    // A leading "1. | <text>" row is the list's own first item, not a
+    // table header — but only when the whole first column actually has
+    // the list shape (mostly ordinal markers); a lone punctuation-styled
+    // rank must not disable the compact-header protection.
+    let is_ordinal_marker = |cell: &str| {
+        let t = cell.trim();
+        t.len() <= 4
+            && t.ends_with(['.', ')'])
+            && !t[..t.len() - 1].is_empty()
+            && t[..t.len() - 1].chars().all(|c| c.is_ascii_digit())
+    };
+    let first_column_list_shape = {
+        let mut markers = 0usize;
+        let mut filled = 0usize;
+        for row in &table.cells {
+            let first = row.first().map(|s| s.trim()).unwrap_or("");
+            if first.is_empty() {
+                continue;
+            }
+            filled += 1;
+            if is_ordinal_marker(first)
+                || first
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(is_ordinal_marker)
+            {
+                markers += 1;
+            }
+        }
+        filled >= 4 && markers * 10 >= filled * 7
+    };
+    let ordinal_header_blocks = header_blocks && !first_column_list_shape;
+    let ordinal_list =
+        !ordinal_header_blocks && table.columns.len() == 2 && table.cells.len() >= 4 && {
+            let mut markers = 0;
+            let mut filled_first = 0;
+            for row in &table.cells {
+                let first = row.first().map(|s| s.trim()).unwrap_or("");
+                if first.is_empty() {
+                    continue;
+                }
+                filled_first += 1;
+                let is_marker = first.len() <= 4
+                    && first.ends_with(['.', ')'])
+                    && first[..first.len() - 1].chars().all(|c| c.is_ascii_digit())
+                    && !first[..first.len() - 1].is_empty();
+                if is_marker {
+                    markers += 1;
+                }
+            }
+            filled_first >= 4 && markers * 10 >= filled_first * 7
+        };
+
+    let is_parallel = !header_blocks
+        && non_empty >= 5
+        // Independent prose columns have asynchronous line/paragraph breaks;
+        // a fully populated grid is positive evidence for a real descriptive
+        // table even when every value is a lowercase sentence fragment.
+        && non_empty < table.cells.len() * table.columns.len()
+        && long_prose >= 4
+        && long_prose * 5 >= non_empty * 3
+        // Row-spanning blanks are common in real headerless description
+        // tables. Require long text in parallel on at least half of occupied
+        // rows, unless a section heading was swallowed into the grid: that is
+        // direct evidence that this candidate is page prose.
+        && ((rows_with_parallel_prose >= 2
+            && rows_with_parallel_prose * 2 >= occupied_rows)
+            || (rows_with_parallel_prose >= 1 && has_numbered_section_heading))
+        && continuation_fragments >= 3
+        && continuation_columns.iter().filter(|&&value| value).count() >= 2;
+    let not_fully_populated = non_empty < table.cells.len() * table.columns.len();
+    // Small 2-column weaves rarely accumulate 3 cross-row continuations —
+    // there aren't enough rows — but long prose in both columns plus a
+    // continuation in each is already the projection signature.
+    let tiny_grid_weave = !header_blocks
+        && table.cells.len() <= 4
+        && not_fully_populated
+        && long_prose >= 4
+        && continuation_fragments >= 2
+        && continuation_columns.iter().filter(|&&value| value).count() >= 2;
+    // Wide multi-column projections of page text: continuations outnumber
+    // the rows and appear in 3+ columns. Genuine wide tables wrap inside
+    // one or two description columns; they never flow everywhere at once.
+    // Long prose cells are required: reference tables whose wrapped
+    // entries continue in every column (short citation fragments) look
+    // continuation-dominated too, but they never read as running text.
+    let continuation_dominated = !header_blocks
+        && not_fully_populated
+        && long_prose >= 4
+        // ...and long prose must be a real share of the grid: a large data
+        // table with a handful of wordy cells and many wrapped-cell
+        // continuations is not a weave.
+        && long_prose * 10 >= non_empty
+        // Continuations must strictly outnumber the rows (with an absolute
+        // floor), preserving the compact-header rule's spirit for every
+        // rejection branch.
+        && continuation_fragments > table.cells.len().max(7)
+        && continuation_columns.iter().filter(|&&value| value).count() >= 3;
+    // Numbered list items ("1. Restructuring ...") woven beside sidebar
+    // fragments: the first column is a monotone ordinal-prefixed list.
+    let ordinal_prefix_list =
+        !ordinal_header_blocks && table.columns.len() == 2 && table.cells.len() >= 4 && {
+            let mut values: Vec<u32> = Vec::new();
+            let mut filled_first = 0;
+            for row in &table.cells {
+                let first = row.first().map(|s| s.trim()).unwrap_or("");
+                if first.is_empty() {
+                    continue;
+                }
+                filled_first += 1;
+                let mut parts = first.splitn(2, char::is_whitespace);
+                let marker = parts.next().unwrap_or("");
+                let rest = parts.next().unwrap_or("").trim();
+                if marker.len() <= 4
+                    && marker.ends_with(['.', ')'])
+                    && marker[..marker.len() - 1]
+                        .chars()
+                        .all(|c| c.is_ascii_digit())
+                    && !marker[..marker.len() - 1].is_empty()
+                    && rest.split_whitespace().count() >= 2
+                {
+                    if let Ok(v) = marker[..marker.len() - 1].parse() {
+                        values.push(v);
+                    }
+                }
+            }
+            filled_first >= 4
+                && values.len() * 10 >= filled_first * 7
+                && values.windows(2).all(|w| w[1] >= w[0])
+        };
+    let is_parallel = is_parallel
+        || word_fragment_grid
+        || ordinal_list
+        || ordinal_prefix_list
+        || tiny_grid_weave
+        || continuation_dominated;
+    log::debug!(
+        "chart table hypothesis: {}x{}, non_empty={}, long_prose={}, parallel_rows={}/{}, section_heading={}, continuation_fragments={}, continuation_columns={}, reject={}",
+        table.rows.len(),
+        table.columns.len(),
+        non_empty,
+        long_prose,
+        rows_with_parallel_prose,
+        occupied_rows,
+        has_numbered_section_heading,
+        continuation_fragments,
+        continuation_columns.iter().filter(|&&value| value).count(),
+        is_parallel
+    );
+    is_parallel
+}
+
+#[derive(Clone, Copy)]
+enum TableOutputMode {
+    Markdown,
+    #[cfg(feature = "ocr")]
+    CompleteTables,
+}
+
+struct TableDetectionOutput {
+    mode: TableOutputMode,
+    pages_with_detected_tables: HashSet<u32>,
+    pages_with_tables: HashSet<u32>,
+    markdown_by_page: HashMap<u32, Vec<PositionedMarkdown>>,
+    #[cfg(feature = "ocr")]
+    complete_tables: Vec<(u32, crate::tables::Table)>,
+}
+
+impl TableDetectionOutput {
+    fn new(mode: TableOutputMode) -> Self {
+        Self {
+            mode,
+            pages_with_detected_tables: HashSet::new(),
+            pages_with_tables: HashSet::new(),
+            markdown_by_page: HashMap::new(),
+            #[cfg(feature = "ocr")]
+            complete_tables: Vec::new(),
+        }
+    }
+
+    fn record(
+        &mut self,
+        page: u32,
+        table: &crate::tables::Table,
+        chart_order: Option<ChartProseOrder>,
+    ) {
+        self.pages_with_detected_tables.insert(page);
+        match self.mode {
+            TableOutputMode::Markdown => {
+                self.pages_with_tables.insert(page);
+                self.markdown_by_page
+                    .entry(page)
+                    .or_default()
+                    .push(PositionedMarkdown::new(
+                        table.rows.first().copied().unwrap_or(0.0),
+                        table.columns.first().copied().unwrap_or(0.0),
+                        crate::tables::table_to_markdown(table),
+                        chart_order,
+                    ));
+            }
+            #[cfg(feature = "ocr")]
+            TableOutputMode::CompleteTables => {
+                if crate::tables::is_complete_data_table(table) {
+                    self.pages_with_tables.insert(page);
+                    self.complete_tables.push((page, table.clone()));
+                }
+            }
+        }
+    }
+
+    fn has_tables_on_page(&self, page: u32) -> bool {
+        self.pages_with_tables.contains(&page)
+    }
+
+    fn has_detected_tables_on_page(&self, page: u32) -> bool {
+        self.pages_with_detected_tables.contains(&page)
+    }
+}
+
+#[derive(Default)]
+struct MarkdownConversionOutput {
+    markdown: String,
+    #[cfg(feature = "ocr")]
+    detected_tables: Vec<(u32, crate::tables::Table)>,
+}
+
 /// Derive a side-by-side split from rect hint regions.
 ///
 /// When `split_side_by_side` doesn't detect a gap (e.g. the text gap is too
@@ -179,6 +923,128 @@ pub(crate) fn split_side_by_side(items: &[TextItem]) -> Vec<(f32, f32)> {
 /// zone layout (calendar months, form sections).  This function checks if hint
 /// regions pair up at the same Y bands and returns `[(x_min, split), (split,
 /// x_max)]` if a consistent split exists.
+/// True when a table-shaped rect cluster (≥6 rects) ends at an interior band
+/// boundary and its rows visibly continue on the far side: cell-like text
+/// across the boundary is y-aligned with most cluster rows, and nearly all
+/// far-side text in the cluster's y-range participates in that alignment.
+/// Tables often rule only their leading columns, so the text gap before the
+/// borderless columns masquerades as a page-layout gutter — a real second
+/// layout column would instead be dense prose that doesn't track table rows.
+fn rect_cluster_spans_band_boundary(
+    items: &[TextItem],
+    rects: &[PdfRect],
+    page: u32,
+    bands: &[(f32, f32)],
+) -> bool {
+    if bands.len() < 2 {
+        return false;
+    }
+    // Normalize: raw PDF rects can carry negative extents.
+    let page_rects: Vec<(f32, f32, f32, f32)> = rects
+        .iter()
+        .filter(|r| r.page == page)
+        .map(|r| {
+            let (x, w) = if r.width < 0.0 {
+                (r.x + r.width, -r.width)
+            } else {
+                (r.x, r.width)
+            };
+            let (y, h) = if r.height < 0.0 {
+                (r.y + r.height, -r.height)
+            } else {
+                (r.y, r.height)
+            };
+            (x, y, w, h)
+        })
+        .collect();
+    if page_rects.len() < 6 {
+        return false;
+    }
+    let clusters = crate::tables::detect_rects::cluster_rects(&page_rects, 3.0, 6);
+    let boundaries: Vec<f32> = bands[..bands.len() - 1].iter().map(|&(_, hi)| hi).collect();
+
+    boundaries.iter().any(|&b| {
+        // Y-ranges of clusters that individually indicate the split cuts a
+        // table: either ruled on both sides of the boundary, or ending at
+        // the boundary with cell-like text row-aligned beyond it.
+        let mut table_y_ranges: Vec<(f32, f32)> = Vec::new();
+        for cluster in &clusters {
+            let bbox = cluster.iter().fold(
+                (
+                    f32::INFINITY,
+                    f32::INFINITY,
+                    f32::NEG_INFINITY,
+                    f32::NEG_INFINITY,
+                ),
+                |(x0, y0, x1, y1), &i| {
+                    let (x, y, w, h) = page_rects[i];
+                    (x0.min(x), y0.min(y), x1.max(x + w), y1.max(y + h))
+                },
+            );
+            let spans = bbox.0 < b - 20.0 && bbox.2 > b + 20.0;
+            let ends_at = bbox.2 >= b - 60.0 && bbox.2 <= b + 10.0 && bbox.0 <= b;
+            if !spans && !ends_at {
+                continue;
+            }
+            // Distinct row baselines of items inside the cluster bbox.
+            let mut row_ys: Vec<f32> = Vec::new();
+            for it in items {
+                let cx = it.x + it.width / 2.0;
+                if it.page == page
+                    && cx > bbox.0
+                    && cx < bbox.2
+                    && it.y >= bbox.1 - 2.0
+                    && it.y <= bbox.3 + 2.0
+                    && !row_ys.iter().any(|&y| (y - it.y).abs() <= 2.0)
+                {
+                    row_ys.push(it.y);
+                }
+            }
+            if row_ys.len() < 2 {
+                continue;
+            }
+            // Cell-like far-side items row-aligned with the cluster.
+            let cell_like = |it: &&TextItem| it.width <= 150.0;
+            let far_aligned_rows = row_ys
+                .iter()
+                .filter(|&&y| {
+                    items.iter().any(|it| {
+                        it.page == page
+                            && it.x + it.width / 2.0 > b
+                            && cell_like(&it)
+                            && (it.y - y).abs() <= 2.0
+                    })
+                })
+                .count();
+            if far_aligned_rows >= 2 && far_aligned_rows * 2 >= row_ys.len() {
+                table_y_ranges.push((bbox.1, bbox.3));
+            }
+        }
+        if table_y_ranges.is_empty() {
+            return false;
+        }
+        // The split is only wrong if the table rows account for most of the
+        // far side. A figure legitimately spanning two text columns leaves
+        // the majority of far-side text (column prose) outside its y-range.
+        let far: Vec<&TextItem> = items
+            .iter()
+            .filter(|it| it.page == page && it.x + it.width / 2.0 > b)
+            .collect();
+        if far.is_empty() {
+            return false;
+        }
+        let inside = far
+            .iter()
+            .filter(|it| {
+                table_y_ranges
+                    .iter()
+                    .any(|&(lo, hi)| it.y >= lo - 2.0 && it.y <= hi + 2.0)
+            })
+            .count();
+        inside * 10 >= far.len() * 6
+    })
+}
+
 fn split_from_hint_regions(items: &[TextItem], rects: &[PdfRect], page: u32) -> Vec<(f32, f32)> {
     use crate::tables::{cluster_rects, RectHintRegion};
 
@@ -379,9 +1245,25 @@ pub(crate) fn filter_lines_to_band(
         .collect()
 }
 
+/// Output policy for Markdown post-processing.
+///
+/// [`MarkdownProfile::Fidelity`] preserves source characters wherever possible.
+/// [`MarkdownProfile::Compact`] enables optional token-saving rewrites that may
+/// be useful for agent context windows but are not byte-faithful to the PDF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MarkdownProfile {
+    /// Preserve source text fidelity. This is the default.
+    #[default]
+    Fidelity,
+    /// Prefer token-efficient output, including collapsing long dot leaders.
+    Compact,
+}
+
 /// Options for markdown conversion
 #[derive(Debug, Clone)]
 pub struct MarkdownOptions {
+    /// Source-fidelity versus token-efficient post-processing policy.
+    pub profile: MarkdownProfile,
     /// Detect headers by font size
     pub detect_headers: bool,
     /// Detect list items
@@ -400,6 +1282,8 @@ pub struct MarkdownOptions {
     pub detect_bold: bool,
     /// Detect and format italic text from font names
     pub detect_italic: bool,
+    /// Emit `<u>` runs for text with a geometrically-detected underline
+    pub detect_underline: bool,
     /// Include image placeholders in output
     pub include_images: bool,
     /// Include extracted hyperlinks
@@ -413,6 +1297,7 @@ pub struct MarkdownOptions {
 impl Default for MarkdownOptions {
     fn default() -> Self {
         Self {
+            profile: MarkdownProfile::default(),
             detect_headers: true,
             detect_lists: true,
             detect_code: true,
@@ -422,7 +1307,17 @@ impl Default for MarkdownOptions {
             fix_hyphenation: true,
             detect_bold: true,
             detect_italic: true,
-            include_images: true,
+            detect_underline: true,
+            // `include_images: false` is intentional. The content-stream walker
+            // now emits `ItemType::Image` `TextItem`s for every Image XObject
+            // it encounters (see `extractor/content_stream.rs`). If we rendered
+            // those into markdown by default, every existing caller would
+            // suddenly see `![Image: Im0](image)` placeholders inserted
+            // throughout their output — a silent regression for anyone who
+            // upgrades. Image bboxes are still available via
+            // `extract_text_with_positions` for callers (e.g. layout-aware
+            // pipelines) that want to crop + caption figures themselves.
+            include_images: false,
             include_links: true,
             include_page_numbers: false,
             strip_headers_footers: true,
@@ -486,6 +1381,14 @@ pub fn to_markdown(text: &str, options: MarkdownOptions) -> String {
     output
 }
 
+/// Applies the document-wide repeated header/footer classifier to grouped lines.
+pub(crate) fn strip_repeated_header_footer_lines(
+    lines: Vec<crate::types::TextLine>,
+    page_count: u32,
+) -> Vec<crate::types::TextLine> {
+    furniture::strip_header_footer_lines(lines, page_count)
+}
+
 /// Convert positioned text items to markdown with structure detection
 pub fn to_markdown_from_items(items: Vec<TextItem>, options: MarkdownOptions) -> String {
     to_markdown_from_items_with_rects(items, options, &[])
@@ -497,15 +1400,55 @@ pub fn to_markdown_from_items_with_rects(
     options: MarkdownOptions,
     rects: &[crate::types::PdfRect],
 ) -> String {
+    let document_page_count = items.iter().map(|item| item.page).max().unwrap_or(0);
+    to_markdown_from_items_with_rects_and_page_count(items, options, rects, document_page_count)
+}
+
+/// Convert positioned text items to Markdown with an authoritative PDF page count.
+///
+/// Use this overload when the owning PDF is available so trailing blank or
+/// unextracted pages are included in document-level header and folio coverage.
+/// Item-only callers can continue using [`to_markdown_from_items_with_rects`],
+/// which falls back to the highest observed item page.
+pub fn to_markdown_from_items_with_rects_and_page_count(
+    items: Vec<TextItem>,
+    options: MarkdownOptions,
+    rects: &[crate::types::PdfRect],
+    document_page_count: u32,
+) -> String {
     to_markdown_from_items_with_rects_and_lines(
         items,
         options,
         rects,
         &[],
-        &HashMap::new(),
-        None,
-        &[],
+        MarkdownDocumentContext {
+            page_thresholds: &HashMap::new(),
+            struct_roles: None,
+            struct_tables: &[],
+            page_count: document_page_count,
+            prefiltered_page_number_pages: None,
+            prefiltered_page_number_mask: None,
+            precomputed_chart_regions: None,
+        },
     )
+}
+
+pub(crate) struct MarkdownDocumentContext<'a> {
+    pub(crate) page_thresholds: &'a HashMap<u32, f32>,
+    pub(crate) struct_roles:
+        Option<&'a HashMap<u32, HashMap<i64, crate::structure_tree::StructRole>>>,
+    pub(crate) struct_tables: &'a [crate::structure_tree::StructTable],
+    pub(crate) page_count: u32,
+    /// Pages where an upstream document-level pass removed folios. This keeps
+    /// table-continuation classification consistent after masked items drop.
+    pub(crate) prefiltered_page_number_pages: Option<&'a HashSet<u32>>,
+    /// Document-level removal decisions aligned with this call's input items.
+    /// Table detection consumes the original items; the mask is applied only
+    /// after table claims have been established.
+    pub(crate) prefiltered_page_number_mask: Option<&'a [bool]>,
+    /// Optional chart masks shared with layout analysis so the geometry is
+    /// detected once and interpreted identically by both pipelines.
+    pub(crate) precomputed_chart_regions: Option<&'a PageChartRegions>,
 }
 
 /// Convert positioned text items to markdown, using rectangles and line segments for table detection.
@@ -517,29 +1460,111 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     options: MarkdownOptions,
     rects: &[crate::types::PdfRect],
     pdf_lines: &[crate::types::PdfLine],
-    page_thresholds: &HashMap<u32, f32>,
-    struct_roles: Option<&HashMap<u32, HashMap<i64, crate::structure_tree::StructRole>>>,
-    struct_tables: &[crate::structure_tree::StructTable],
+    context: MarkdownDocumentContext<'_>,
 ) -> String {
+    convert_items_with_rects_lines_and_table_output(
+        items,
+        options,
+        rects,
+        pdf_lines,
+        context,
+        TableOutputMode::Markdown,
+    )
+    .markdown
+}
+
+/// Run the ordinary Markdown table pipeline but return only structurally
+/// complete data tables. Supplemental OCR uses this to keep detector behavior
+/// identical without parsing the serialized Markdown back into tables.
+#[cfg(feature = "ocr")]
+pub(crate) fn complete_table_markdown_from_items(
+    items: Vec<TextItem>,
+    options: MarkdownOptions,
+    document_page_count: u32,
+) -> String {
+    let conversion = convert_items_with_rects_lines_and_table_output(
+        items,
+        options,
+        &[],
+        &[],
+        MarkdownDocumentContext {
+            page_thresholds: &HashMap::new(),
+            struct_roles: None,
+            struct_tables: &[],
+            page_count: document_page_count,
+            prefiltered_page_number_pages: None,
+            prefiltered_page_number_mask: None,
+            precomputed_chart_regions: None,
+        },
+        TableOutputMode::CompleteTables,
+    );
+    let mut output = String::new();
+    for (_, table) in conversion.detected_tables {
+        let markdown = crate::tables::table_to_markdown(&table);
+        if markdown.is_empty() {
+            continue;
+        }
+        if !output.is_empty() && !output.ends_with("\n\n") {
+            output.push('\n');
+        }
+        output.push_str(&markdown);
+    }
+    output
+}
+
+fn convert_items_with_rects_lines_and_table_output(
+    items: Vec<TextItem>,
+    options: MarkdownOptions,
+    rects: &[crate::types::PdfRect],
+    pdf_lines: &[crate::types::PdfLine],
+    context: MarkdownDocumentContext<'_>,
+    table_output_mode: TableOutputMode,
+) -> MarkdownConversionOutput {
     use crate::tables::{
-        detect_tables, detect_tables_from_lines, detect_tables_from_rects,
-        detect_tables_from_struct_tree, table_to_markdown, try_build_rect_guided_table,
+        content_width, detect_tables_from_lines, detect_tables_from_rects,
+        detect_tables_from_struct_tree, detect_tables_with_page_width, try_build_rect_guided_table,
     };
     use crate::types::ItemType;
 
+    let MarkdownDocumentContext {
+        page_thresholds,
+        struct_roles,
+        struct_tables,
+        page_count: document_page_count,
+        prefiltered_page_number_pages,
+        prefiltered_page_number_mask,
+        precomputed_chart_regions,
+    } = context;
+
     if items.is_empty() {
-        return String::new();
+        return MarkdownConversionOutput::default();
     }
+
+    // Table detection must retain the original collection because short
+    // numeric table cells can be indistinguishable from folios until
+    // structural context is available. A precomputed mask carries the
+    // document-wide decision without removing items before table claims.
+    debug_assert!(prefiltered_page_number_mask.is_none_or(|mask| mask.len() == items.len()));
+    let has_precomputed_page_number_mask = prefiltered_page_number_mask.is_some();
+    let removed_page_number_pages = prefiltered_page_number_pages.cloned().unwrap_or_default();
 
     // Separate images and links from text items
     let mut images: Vec<TextItem> = Vec::new();
+    let mut page_image_regions: HashMap<u32, Vec<(f32, f32, f32, f32)>> = HashMap::new();
     let mut links: Vec<TextItem> = Vec::new();
     let mut text_items: Vec<TextItem> = Vec::new();
+    let mut text_item_page_number_mask: Vec<bool> = Vec::new();
 
-    for item in items {
+    for (input_index, item) in items.into_iter().enumerate() {
         match &item.item_type {
             ItemType::Image => {
-                if options.include_images {
+                page_image_regions.entry(item.page).or_default().push((
+                    item.x,
+                    item.y,
+                    item.x + item.width,
+                    item.y + item.height,
+                ));
+                if options.include_images || item.text.starts_with(PDF_IMAGE_SCHEME) {
                     images.push(item);
                 }
             }
@@ -549,6 +1574,12 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                 }
             }
             ItemType::Text | ItemType::FormField => {
+                text_item_page_number_mask.push(
+                    prefiltered_page_number_mask
+                        .and_then(|mask| mask.get(input_index))
+                        .copied()
+                        .unwrap_or(false),
+                );
                 text_items.push(item);
             }
         }
@@ -562,18 +1593,13 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
 
     // Detect tables on each page
     let mut table_items: HashSet<usize> = HashSet::new();
-    let mut page_tables: HashMap<u32, Vec<(f32, String)>> = HashMap::new();
+    let mut table_output = TableDetectionOutput::new(table_output_mode);
 
-    // Store images by page and Y position for insertion
-    let mut page_images: HashMap<u32, Vec<(f32, String)>> = HashMap::new();
-
-    for img in &images {
-        let img_md = format!("![image](pdf-image://{})\n", img.text);
-        page_images
-            .entry(img.page)
-            .or_default()
-            .push((img.y, img_md));
-    }
+    // Running headers/footers repeat verbatim at the same position on many
+    // pages. When such a block wraps a long title over aligned lines, the
+    // heuristic detector reads it as a table. Knowing which items are page
+    // furniture is a document-wide question, so answer it once here.
+    let running_furniture = running_furniture_keys(&text_items);
 
     // Pre-group items by page with their global indices (O(n) instead of O(pages*n))
     let mut page_groups: HashMap<u32, Vec<(usize, &TextItem)>> = HashMap::new();
@@ -584,28 +1610,81 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
             .push((global_idx, item));
     }
 
+    // Chart regions per page: their text must not steer column detection
+    // during line grouping (it fills the gutter and fuses two-column lines).
+    let page_chart_map = precomputed_chart_regions
+        .cloned()
+        .unwrap_or_else(|| chart_regions_by_page(&text_items, rects, pdf_lines));
+
     let mut pages: Vec<u32> = page_groups.keys().copied().collect();
     pages.sort();
-    let page_count = pages.last().copied().unwrap_or(0) + 1;
 
     // Track band splits per page so we can split non-table items later
     let mut page_band_splits: HashMap<u32, Vec<(f32, f32)>> = HashMap::new();
+    // Chart pages with two prose columns use the chart's vertical span as a
+    // full-width separator and read each surrounding prose zone by column.
+    let mut page_chart_prose_splits: HashMap<u32, f32> = HashMap::new();
+    let mut page_chart_prose_orders: HashMap<u32, ChartProseOrder> = HashMap::new();
 
     for page in pages {
         let group = page_groups.get(&page).unwrap();
         let page_items: Vec<TextItem> = group.iter().map(|(_, item)| (*item).clone()).collect();
+        let page_content_width = content_width(&page_items);
 
-        // Detect columns early — on multi-column pages, the merged-band retry
-        // should skip body-font heuristic table detection (which mistakes column
-        // text for tables). Individual band heuristic detection is left enabled
-        // because bands are scoped to single columns.
-        let page_has_columns = {
-            let cols = crate::extractor::detect_columns(&page_items, page, false);
+        // Chart-bar regions: bar charts drawn as filled rects read as cell
+        // rects or aligned text and get gridded into phantom tables. Their
+        // items are excluded from every table detector below and flow through
+        // as plain text instead.
+        let chart_regions: Vec<(f32, f32, f32, f32)> =
+            page_chart_map.get(&page).cloned().unwrap_or_default();
+        let in_chart = |item: &TextItem| item_is_in_chart_region(item, &chart_regions);
+        let page_layout_items = items_outside_chart_regions(&page_items, &chart_regions);
+
+        // Detect columns on chart-free text. Chart labels and values often fill
+        // the prose gutter, hiding real columns and allowing body text to reach
+        // heuristic table detection as one page-wide region.
+        let detected_columns = {
+            let cols = crate::extractor::detect_columns(&page_layout_items, page, false);
             cols.len() >= 2
         };
+        if !chart_regions.is_empty() {
+            log::debug!(
+                "page {}: {} chart region(s) masked from table detection",
+                page,
+                chart_regions.len()
+            );
+        }
 
-        // Check for side-by-side layout (e.g. two tables placed left and right)
+        // Repeated prose anchors provide a second, chart-scoped column signal.
+        // It does not partition table detection: a narrow or partly spanning
+        // gutter is too ambiguous for that. It can reject a body-font table
+        // hypothesis and later order prose within chart-separated zones.
+        // Multiple charts create several narrow vertical zones whose local
+        // column structure needs stronger region-graph reasoning. Keep those
+        // pages on the conservative full-page grouping path for now.
+        let chart_prose_split = chart_regions.first().and_then(|&region| {
+            if chart_regions.len() != 1 {
+                return None;
+            }
+            chart_page_prose_column_split(&page_layout_items)
+                .filter(|&split_x| chart_spans_prose_split(region, split_x))
+        });
+
+        // Check for side-by-side table layout using the original items. Sparse
+        // numeric cells need table context before they can be distinguished
+        // safely from folios; cleaned evidence is reserved for column and
+        // final non-table layout decisions.
         let mut bands = split_side_by_side(&page_items);
+        // A rect table crossing a proposed split boundary means the "gutter"
+        // is really the gap between ruled and borderless table columns —
+        // splitting there cleaves the table in half. Veto the split.
+        if !bands.is_empty() && rect_cluster_spans_band_boundary(&page_items, rects, page, &bands) {
+            log::debug!(
+                "page {}: side-by-side split vetoed by spanning rect cluster",
+                page
+            );
+            bands.clear();
+        }
         // Fallback: use rect hint regions to detect side-by-side layout
         // when the text gap is too narrow for split_side_by_side to detect
         // (e.g. calendars with left/right month columns ~10pt apart).
@@ -618,6 +1697,19 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                 page_band_splits.insert(page, bands.clone());
             }
         }
+        // Anchor-derived prose splits are lower-confidence than physical
+        // gutters, so they do not partition table detection. They are applied
+        // later only to vertical zones outside the chart. Physical bands can
+        // still scope table detection without disabling this page-level prose
+        // and positioned-block order.
+        let chart_prose_order = chart_prose_split.and_then(|split_x| {
+            chart_regions.first().copied().map(|region| {
+                page_chart_prose_splits.insert(page, split_x);
+                let order = ChartProseOrder::new(split_x, region);
+                page_chart_prose_orders.insert(page, order);
+                order
+            })
+        });
 
         // Build list of (band_items, band_index_map, band_rects, band_lines).
         // band_index_map[local_band_idx] → page_items index.
@@ -687,6 +1779,16 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
             // Track which band-local indices are claimed by structural detection
             let mut rect_claimed: HashSet<usize> = HashSet::new();
 
+            // Pre-claim chart items: every detector below skips claimed
+            // indices, and unclaimed-by-tables text flows out as plain lines.
+            if !chart_regions.is_empty() {
+                for (idx, item) in band_items.iter().enumerate() {
+                    if in_chart(item) {
+                        rect_claimed.insert(idx);
+                    }
+                }
+            }
+
             // 0. Structure-tree detection (highest priority — semantic PDF tagging)
             //    Only use struct-tree tables when they capture a majority (≥50%) of
             //    band items.  Incomplete struct trees (partial tagging) should fall
@@ -706,12 +1808,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                             }
                         }
                     }
-                    let table_y = table.rows.first().copied().unwrap_or(0.0);
-                    let table_md = table_to_markdown(table);
-                    page_tables
-                        .entry(page)
-                        .or_default()
-                        .push((table_y, table_md));
+                    table_output.record(page, table, chart_prose_order);
                 }
             }
 
@@ -735,12 +1832,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                         }
                     }
                 }
-                let table_y = table.rows.first().copied().unwrap_or(0.0);
-                let table_md = table_to_markdown(table);
-                page_tables
-                    .entry(page)
-                    .or_default()
-                    .push((table_y, table_md));
+                table_output.record(page, table, chart_prose_order);
             }
 
             // 2. Line-based detection on unclaimed items (when rects didn't find tables)
@@ -755,12 +1847,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                             }
                         }
                     }
-                    let table_y = table.rows.first().copied().unwrap_or(0.0);
-                    let table_md = table_to_markdown(table);
-                    page_tables
-                        .entry(page)
-                        .or_default()
-                        .push((table_y, table_md));
+                    table_output.record(page, table, chart_prose_order);
                 }
             }
 
@@ -796,12 +1883,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                                 }
                             }
                         }
-                        let table_y = table.rows.first().copied().unwrap_or(0.0);
-                        let table_md = table_to_markdown(&table);
-                        page_tables
-                            .entry(page)
-                            .or_default()
-                            .push((table_y, table_md));
+                        table_output.record(page, &table, chart_prose_order);
                         for &band_idx in &inside_map {
                             rect_claimed.insert(band_idx);
                         }
@@ -815,8 +1897,41 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                     if subset_items.len() < min_items {
                         return;
                     }
-                    let tables = detect_tables(subset_items, base_size, false);
+                    // Reject candidates whose cells prove they are parallel
+                    // prose fragments — the shape produced when the body-font
+                    // pass projects a multi-column text page onto one table
+                    // grid (two-column reference sections are the classic
+                    // case). The check needs internal transition evidence
+                    // (unterminated cells flowing into lowercase starts in
+                    // the same column), so genuine tables with long cells
+                    // pass. Band-split retries stay exempt: they exist for
+                    // tables that only assemble after recombining bands.
+                    let reject_parallel_prose = !was_split;
+                    let tables = detect_tables_with_page_width(
+                        subset_items,
+                        base_size,
+                        false,
+                        page_content_width,
+                    );
                     for table in tables {
+                        if reject_parallel_prose && is_parallel_prose_table(&table) {
+                            log::debug!(
+                                "page {}: rejected {}x{} parallel-prose table hypothesis",
+                                page,
+                                table.rows.len(),
+                                table.columns.len()
+                            );
+                            continue;
+                        }
+                        if is_running_furniture_table(subset_items, &table, &running_furniture) {
+                            log::debug!(
+                                "page {}: rejected {}x{} running header/footer table hypothesis",
+                                page,
+                                table.rows.len(),
+                                table.columns.len()
+                            );
+                            continue;
+                        }
                         for &idx in &table.item_indices {
                             if let Some(&band_idx) = index_map.get(idx) {
                                 if let Some(&page_idx) = band_index_map.get(band_idx) {
@@ -826,12 +1941,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                                 }
                             }
                         }
-                        let table_y = table.rows.first().copied().unwrap_or(0.0);
-                        let table_md = table_to_markdown(&table);
-                        page_tables
-                            .entry(page)
-                            .or_default()
-                            .push((table_y, table_md));
+                        table_output.record(page, &table, chart_prose_order);
                     }
                 };
 
@@ -893,12 +2003,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                             }
                         }
                     }
-                    let table_y = table.rows.first().copied().unwrap_or(0.0);
-                    let table_md = table_to_markdown(&table);
-                    page_tables
-                        .entry(page)
-                        .or_default()
-                        .push((table_y, table_md));
+                    table_output.record(page, &table, chart_prose_order);
                 }
             }
         }
@@ -906,7 +2011,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         // 5. Thin-rect border synthesis: last resort for PDFs that draw table
         //    borders as thin filled rectangles (common in spreadsheet exports).
         //    Only runs when ALL other methods found nothing on this page.
-        if !page_tables.contains_key(&page) {
+        if !table_output.has_detected_tables_on_page(page) {
             let page_rects: Vec<&crate::types::PdfRect> =
                 rects.iter().filter(|r| r.page == page).collect();
             let mut synth_lines: Vec<crate::types::PdfLine> = Vec::new();
@@ -942,22 +2047,22 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                 }
             }
             if synth_lines.len() >= 10 {
-                let page_text: Vec<TextItem> = text_items
+                // Chart text stays out of the thin-rect fallback too — a
+                // chart's thin grid rules would otherwise re-grid it.
+                let (page_text, page_text_map): (Vec<TextItem>, Vec<usize>) = text_items
                     .iter()
-                    .filter(|i| i.page == page)
-                    .cloned()
-                    .collect();
+                    .enumerate()
+                    .filter(|(_, i)| i.page == page && !in_chart(i))
+                    .map(|(idx, i)| (i.clone(), idx))
+                    .unzip();
                 let line_tables = detect_tables_from_lines(&page_text, &synth_lines, page);
                 for table in &line_tables {
                     for &idx in &table.item_indices {
-                        table_items.insert(idx);
+                        if let Some(&global_idx) = page_text_map.get(idx) {
+                            table_items.insert(global_idx);
+                        }
                     }
-                    let table_y = table.rows.first().copied().unwrap_or(0.0);
-                    let table_md = table_to_markdown(table);
-                    page_tables
-                        .entry(page)
-                        .or_default()
-                        .push((table_y, table_md));
+                    table_output.record(page, table, chart_prose_order);
                 }
             }
         }
@@ -966,7 +2071,7 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         // any band, retry heuristic detection with all items as a single band.
         // This catches borderless tables whose text-column alignment was
         // misclassified as page-layout columns.
-        if was_split && !page_tables.contains_key(&page) && !merged_band.0.is_empty() {
+        if was_split && !table_output.has_tables_on_page(page) && !merged_band.0.is_empty() {
             let (ref band_items, ref band_index_map, _, _) = merged_band;
             log::debug!(
                 "page {}: merged-band retry ({} items, was_split={})",
@@ -974,23 +2079,89 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                 band_items.len(),
                 was_split
             );
-            let heuristic_tables = detect_tables(band_items, base_size, page_has_columns);
+            // Chart text stays out of the retry as well.
+            let (chart_free, chart_free_map): (Vec<TextItem>, Vec<usize>) = band_items
+                .iter()
+                .enumerate()
+                .filter(|(_, it)| !in_chart(it))
+                .map(|(i, it)| (it.clone(), i))
+                .unzip();
+            // A chart-derived column signal must not disable body-font table
+            // detection during the merged-band retry: this retry exists for
+            // tables that only become visible after recombining false layout
+            // bands. Keep the legacy skip on ordinary detected-column pages,
+            // and reject chart-page prose candidates individually below.
+            let skip_body_font =
+                merged_retry_skips_body_font(detected_columns, !chart_regions.is_empty());
+            let heuristic_tables = detect_tables_with_page_width(
+                &chart_free,
+                base_size,
+                skip_body_font,
+                page_content_width,
+            );
             for table in &heuristic_tables {
+                if !chart_regions.is_empty() && is_parallel_prose_table(table) {
+                    log::debug!(
+                        "page {}: rejected {}x{} merged-band parallel-prose table hypothesis",
+                        page,
+                        table.rows.len(),
+                        table.columns.len()
+                    );
+                    continue;
+                }
+                if is_running_furniture_table(&chart_free, table, &running_furniture) {
+                    log::debug!(
+                        "page {}: rejected {}x{} merged-band running header/footer table hypothesis",
+                        page,
+                        table.rows.len(),
+                        table.columns.len()
+                    );
+                    continue;
+                }
                 for &idx in &table.item_indices {
-                    if let Some(&page_idx) = band_index_map.get(idx) {
+                    if let Some(&page_idx) = chart_free_map
+                        .get(idx)
+                        .and_then(|&band_idx| band_index_map.get(band_idx))
+                    {
                         if let Some(&(global_idx, _)) = group.get(page_idx) {
                             table_items.insert(global_idx);
                         }
                     }
                 }
-                let table_y = table.rows.first().copied().unwrap_or(0.0);
-                let table_md = table_to_markdown(table);
-                page_tables
-                    .entry(page)
-                    .or_default()
-                    .push((table_y, table_md));
+                table_output.record(page, table, chart_prose_order);
             }
         }
+    }
+
+    #[cfg(feature = "ocr")]
+    let mut detected_tables = table_output.complete_tables;
+    #[cfg(feature = "ocr")]
+    detected_tables.sort_by_key(|(page, _)| *page);
+    let mut page_tables = table_output.markdown_by_page;
+
+    // Images are also removed before line grouping, so give them the same
+    // logical chart-page position as tables before reinsertion.
+    let mut page_images: HashMap<u32, Vec<PositionedMarkdown>> = HashMap::new();
+    for img in &images {
+        let img_name = img
+            .text
+            .strip_prefix("[Image: ")
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(&img.text);
+        let img_md = if img.text.starts_with(PDF_IMAGE_SCHEME) {
+            format!("![image]({})\n", img.text)
+        } else {
+            format!("![Image: {}](image)\n", img_name)
+        };
+        page_images
+            .entry(img.page)
+            .or_default()
+            .push(PositionedMarkdown::new(
+                img.y,
+                img.x,
+                img_md,
+                page_chart_prose_orders.get(&img.page).copied(),
+            ));
     }
 
     // Check structure tree coverage on ALL text items (before table filtering)
@@ -1028,16 +2199,20 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     };
 
     // Filter out table items and process the rest
-    let non_table_items: Vec<TextItem> = text_items
+    let non_table_items: Vec<(usize, TextItem)> = text_items
         .into_iter()
         .enumerate()
         .filter(|(idx, _)| !table_items.contains(idx))
-        .map(|(_, item)| item)
         .collect();
 
     // Find pages that are table-only (no remaining non-table text)
     let table_only_pages: HashSet<u32> = {
-        let pages_with_text: HashSet<u32> = non_table_items.iter().map(|i| i.page).collect();
+        let mut pages_with_text: HashSet<u32> =
+            non_table_items.iter().map(|(_, item)| item.page).collect();
+        // Preserve the pre-filter continuation classification: a page that
+        // originally also contained a folio does not become table-only merely
+        // because an upstream document-level pass removed it.
+        pages_with_text.extend(removed_page_number_pages);
         page_tables
             .keys()
             .filter(|p| !pages_with_text.contains(p))
@@ -1052,17 +2227,46 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     // column detection on pages where table column gaps would be misidentified.
     let table_page_set: HashSet<u32> = page_tables.keys().copied().collect();
 
+    let non_table_items = if has_precomputed_page_number_mask {
+        non_table_items
+            .into_iter()
+            .filter(|(index, _)| !text_item_page_number_mask[*index])
+            .map(|(_, item)| item)
+            .collect()
+    } else {
+        crate::extractor::filter_markdown_page_numbers_with_removed_pages(
+            non_table_items.into_iter().map(|(_, item)| item).collect(),
+            document_page_count,
+        )
+        .0
+    };
+
     // Split non-table items by band boundaries before line grouping so that
     // items from different side-by-side zones (e.g. left/right month columns
     // in a calendar) don't merge into the same line.
-    let lines = if page_band_splits.is_empty() {
-        group_into_lines_with_thresholds(non_table_items, page_thresholds, &table_page_set)
+    let lines = if page_band_splits.is_empty() && page_chart_prose_splits.is_empty() {
+        crate::extractor::group_prefiltered_items_into_lines_with_thresholds_and_regions(
+            non_table_items,
+            page_thresholds,
+            &table_page_set,
+            &page_chart_map,
+            &page_image_regions,
+        )
     } else {
-        // Separate items into band-split pages and non-split pages
+        // Separate items into physical-band pages, chart/prose pages, and
+        // ordinary pages. Chart/prose pages need a different reading order:
+        // each chart is a full-width separator, while prose above and below
+        // it reads down the left column and then down the right column.
         let mut split_page_items: HashMap<u32, Vec<TextItem>> = HashMap::new();
+        let mut chart_prose_page_items: HashMap<u32, Vec<TextItem>> = HashMap::new();
         let mut unsplit_items: Vec<TextItem> = Vec::new();
         for item in non_table_items {
-            if page_band_splits.contains_key(&item.page) {
+            if page_chart_prose_splits.contains_key(&item.page) {
+                chart_prose_page_items
+                    .entry(item.page)
+                    .or_default()
+                    .push(item);
+            } else if page_band_splits.contains_key(&item.page) {
                 split_page_items.entry(item.page).or_default().push(item);
             } else {
                 unsplit_items.push(item);
@@ -1070,7 +2274,13 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
         }
         // Process unsplit pages normally
         let mut all_lines =
-            group_into_lines_with_thresholds(unsplit_items, page_thresholds, &table_page_set);
+            crate::extractor::group_prefiltered_items_into_lines_with_thresholds_and_regions(
+                unsplit_items,
+                page_thresholds,
+                &table_page_set,
+                &page_chart_map,
+                &page_image_regions,
+            );
         // Process each split page's bands independently, then interleave
         // by Y position so paired zones (e.g. left/right months) appear together.
         let mut split_pages: Vec<u32> = split_page_items.keys().copied().collect();
@@ -1087,11 +2297,14 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                     .cloned()
                     .collect();
                 if !band_items.is_empty() {
-                    page_lines.extend(group_into_lines_with_thresholds(
-                        band_items,
-                        page_thresholds,
-                        &table_page_set,
-                    ));
+                    page_lines.extend(
+                        crate::extractor::group_prefiltered_items_into_lines_with_thresholds_and_charts(
+                            band_items,
+                            page_thresholds,
+                            &table_page_set,
+                            &page_chart_map,
+                        ),
+                    );
                 }
             }
             // Sort by Y descending (top to bottom) so left and right
@@ -1099,26 +2312,108 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
             page_lines.sort_by(|a, b| b.y.total_cmp(&a.y));
             all_lines.extend(page_lines);
         }
+
+        // Process chart/prose pages as alternating vertical zones. Within a
+        // prose zone, group each column independently and append columns in
+        // newspaper order. Within a chart zone, group the full width normally.
+        let mut chart_prose_pages: Vec<u32> = chart_prose_page_items.keys().copied().collect();
+        chart_prose_pages.sort();
+        for page in chart_prose_pages {
+            let mut remaining = chart_prose_page_items.remove(&page).unwrap();
+            let split_x = page_chart_prose_splits[&page];
+            let chart_regions = &page_chart_map[&page];
+            let group_prose_zone = |zone_items: Vec<TextItem>| {
+                let mut zone_lines = Vec::new();
+                for right_column in [false, true] {
+                    let column_items: Vec<TextItem> = zone_items
+                        .iter()
+                        .filter(|item| (item.x >= split_x) == right_column)
+                        .cloned()
+                        .collect();
+                    if !column_items.is_empty() {
+                        zone_lines.extend(
+                            crate::extractor::group_prefiltered_items_into_lines_with_thresholds_and_charts(
+                                column_items,
+                                page_thresholds,
+                                &table_page_set,
+                                &page_chart_map,
+                            ),
+                        );
+                    }
+                }
+                zone_lines
+            };
+
+            let mut chart_y_bands: Vec<(f32, f32)> = page_chart_map[&page]
+                .iter()
+                .map(|&(_, y0, _, y1)| (y0 - CHART_SEPARATOR_PAD, y1 + CHART_SEPARATOR_PAD))
+                .collect();
+            chart_y_bands.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let mut merged_chart_y_bands: Vec<(f32, f32)> = Vec::new();
+            for (low, high) in chart_y_bands {
+                if let Some(last) = merged_chart_y_bands.last_mut() {
+                    if high >= last.0 {
+                        last.0 = last.0.min(low);
+                        last.1 = last.1.max(high);
+                        continue;
+                    }
+                }
+                merged_chart_y_bands.push((low, high));
+            }
+
+            for (low, high) in merged_chart_y_bands {
+                let (above, at_or_below): (Vec<TextItem>, Vec<TextItem>) =
+                    remaining.into_iter().partition(|item| {
+                        item.y > high && !item_is_in_chart_region(item, chart_regions)
+                    });
+                all_lines.extend(group_prose_zone(above));
+
+                let (chart_zone, below): (Vec<TextItem>, Vec<TextItem>) =
+                    at_or_below.into_iter().partition(|item| {
+                        item.y >= low || item_is_in_chart_region(item, chart_regions)
+                    });
+                all_lines.extend(
+                    crate::extractor::group_prefiltered_items_into_lines_with_thresholds_and_charts(
+                        chart_zone,
+                        page_thresholds,
+                        &table_page_set,
+                        &page_chart_map,
+                    ),
+                );
+                remaining = below;
+            }
+            all_lines.extend(group_prose_zone(remaining));
+        }
+        // The three processing paths above are accumulated separately. Restore
+        // document page order while preserving each page's chosen line order.
+        all_lines.sort_by_key(|line| line.page);
         all_lines
     };
 
     // Strip repeated headers/footers before conversion
     let lines = if options.strip_headers_footers {
-        preprocess::strip_repeated_lines(lines, page_count)
+        furniture::strip_header_footer_lines(lines, document_page_count)
     } else {
         lines
     };
 
     // Convert to markdown, inserting tables and images at appropriate positions
-    let band_split_page_set: HashSet<u32> = page_band_splits.keys().copied().collect();
-    to_markdown_from_lines_with_tables_and_images(
+    let mut band_split_page_set: HashSet<u32> = page_band_splits.keys().copied().collect();
+    band_split_page_set.extend(page_chart_prose_splits.keys().copied());
+    let markdown = to_markdown_from_lines_with_tables_and_images(
         lines,
         options,
         page_tables,
         page_images,
+        &page_chart_map,
         &band_split_page_set,
         effective_struct_roles,
-    )
+    );
+    MarkdownConversionOutput {
+        markdown,
+        #[cfg(feature = "ocr")]
+        detected_tables,
+    }
 }
 
 #[cfg(test)]
@@ -1126,6 +2421,35 @@ mod tests {
     use super::*;
     use analysis::detect_header_level;
     use classify::{is_code_like, is_list_item};
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn complete_table_output_marks_only_pages_with_emitted_tables() {
+        let mut output = TableDetectionOutput::new(TableOutputMode::CompleteTables);
+        let incomplete = crate::tables::Table::new(
+            vec![100.0, 200.0],
+            vec![300.0],
+            vec![vec!["header a".into(), "header b".into()]],
+            vec![0, 1],
+        );
+        output.record(1, &incomplete, None);
+        assert!(output.has_detected_tables_on_page(1));
+        assert!(!output.has_tables_on_page(1));
+        assert!(output.complete_tables.is_empty());
+
+        let complete = crate::tables::Table::new(
+            vec![100.0, 200.0],
+            vec![300.0, 280.0],
+            vec![
+                vec!["header a".into(), "header b".into()],
+                vec!["value a".into(), "value b".into()],
+            ],
+            vec![0, 1, 2, 3],
+        );
+        output.record(1, &complete, None);
+        assert!(output.has_tables_on_page(1));
+        assert_eq!(output.complete_tables.len(), 1);
+    }
 
     #[test]
     fn test_is_list_item() {
@@ -1157,29 +2481,29 @@ mod tests {
     fn test_detect_header_level() {
         // With three tiers: 24→H1, 18→H2, 15→H3, 12→None
         let tiers = vec![24.0, 18.0, 15.0];
-        assert_eq!(detect_header_level(24.0, 12.0, &tiers), Some(1));
-        assert_eq!(detect_header_level(18.0, 12.0, &tiers), Some(2));
-        assert_eq!(detect_header_level(15.0, 12.0, &tiers), Some(3));
-        assert_eq!(detect_header_level(12.0, 12.0, &tiers), None);
+        assert_eq!(detect_header_level(24.0, 12.0, &tiers, false), Some(1));
+        assert_eq!(detect_header_level(18.0, 12.0, &tiers, false), Some(2));
+        assert_eq!(detect_header_level(15.0, 12.0, &tiers, false), Some(3));
+        assert_eq!(detect_header_level(12.0, 12.0, &tiers, false), None);
 
         // Single tier: 15→H1 (ratio 1.25 ≥ 1.2), 14→None (ratio 1.17 < 1.2)
         let tiers = vec![15.0];
-        assert_eq!(detect_header_level(15.0, 12.0, &tiers), Some(1));
-        assert_eq!(detect_header_level(14.0, 12.0, &tiers), None);
-        assert_eq!(detect_header_level(12.0, 12.0, &tiers), None);
+        assert_eq!(detect_header_level(15.0, 12.0, &tiers, false), Some(1));
+        assert_eq!(detect_header_level(14.0, 12.0, &tiers, false), None);
+        assert_eq!(detect_header_level(12.0, 12.0, &tiers, false), None);
 
         // No tiers (empty): falls back to ratio thresholds
         let tiers: Vec<f32> = vec![];
-        assert_eq!(detect_header_level(24.0, 12.0, &tiers), Some(1));
-        assert_eq!(detect_header_level(18.0, 12.0, &tiers), Some(2));
-        assert_eq!(detect_header_level(15.0, 12.0, &tiers), Some(3));
-        assert_eq!(detect_header_level(14.5, 12.0, &tiers), Some(4));
-        assert_eq!(detect_header_level(14.0, 12.0, &tiers), None);
-        assert_eq!(detect_header_level(12.0, 12.0, &tiers), None);
+        assert_eq!(detect_header_level(24.0, 12.0, &tiers, false), Some(1));
+        assert_eq!(detect_header_level(18.0, 12.0, &tiers, false), Some(2));
+        assert_eq!(detect_header_level(15.0, 12.0, &tiers, false), Some(3));
+        assert_eq!(detect_header_level(14.5, 12.0, &tiers, false), Some(4));
+        assert_eq!(detect_header_level(14.0, 12.0, &tiers, false), None);
+        assert_eq!(detect_header_level(12.0, 12.0, &tiers, false), None);
 
         // Body text excluded when tiers exist: 13pt (ratio 1.08) → None
         let tiers = vec![20.0];
-        assert_eq!(detect_header_level(13.0, 12.0, &tiers), None);
+        assert_eq!(detect_header_level(13.0, 12.0, &tiers, false), None);
     }
 
     #[test]
@@ -1190,6 +2514,174 @@ mod tests {
         assert!(md.contains("- Second item"));
     }
 
+    fn furniture_item(text: &str, x: f32, y: f32, page: u32) -> TextItem {
+        let mut it = make_item(x, y, page);
+        it.text = text.into();
+        it
+    }
+
+    /// Items repeating verbatim at the same position on 3+ pages are running
+    /// furniture; the same text on fewer pages, or at different positions, is
+    /// not.
+    #[test]
+    fn running_furniture_requires_three_pages_at_same_position() {
+        let mut items = Vec::new();
+        for page in 1..=3 {
+            // Body content so each page has a real vertical extent.
+            items.push(furniture_item("body", 85.0, 700.0, page));
+            items.push(furniture_item("TITULAR DEL", 85.0, 68.0, page));
+        }
+        // Same text but only two pages.
+        for page in 1..=2 {
+            items.push(furniture_item("SECRETARÍA", 200.0, 68.0, page));
+        }
+        // Same text on three pages but at drifting positions.
+        for (page, x) in [(1, 300.0), (2, 320.0), (3, 340.0)] {
+            items.push(furniture_item("MÉXICO", x, 68.0, page));
+        }
+
+        let running = running_furniture_keys(&items);
+        assert!(running.contains(&furniture_key(&furniture_item(
+            "TITULAR DEL",
+            85.0,
+            68.0,
+            1
+        ))));
+        assert!(!running.contains(&furniture_key(&furniture_item(
+            "SECRETARÍA",
+            200.0,
+            68.0,
+            1
+        ))));
+        assert!(!running.contains(&furniture_key(&furniture_item("MÉXICO", 300.0, 68.0, 1))));
+    }
+
+    /// A table made of running-footer items is vetoed; a table whose body rows
+    /// carry per-page content is kept even when its header row repeats.
+    #[test]
+    fn running_furniture_table_veto() {
+        // The footer block, present identically on pages 1-3.
+        let mut items = Vec::new();
+        for page in 1..=3 {
+            items.push(furniture_item("PROPOSICIÓN CON PUNTO", 85.0, 78.5, page));
+            items.push(furniture_item("EL SENADO", 286.6, 78.5, page));
+            items.push(furniture_item("TITULAR DEL", 85.0, 68.0, page));
+            items.push(furniture_item("A TRAVÉS DE LA", 243.4, 68.0, page));
+        }
+        // A real table on page 1: repeated header row, per-page data rows.
+        let header = [
+            furniture_item("Year", 85.0, 500.0, 1),
+            furniture_item("Total", 200.0, 500.0, 1),
+        ];
+        let data = [
+            furniture_item("2023", 85.0, 488.0, 1),
+            furniture_item("1,204", 200.0, 488.0, 1),
+            furniture_item("2024", 85.0, 476.0, 1),
+            furniture_item("1,377", 200.0, 476.0, 1),
+        ];
+        // Header repeats on every page (like a continued table's header).
+        for page in 2..=3 {
+            items.push(furniture_item("Year", 85.0, 500.0, page));
+            items.push(furniture_item("Total", 200.0, 500.0, page));
+        }
+        items.extend(header.iter().cloned());
+        items.extend(data.iter().cloned());
+
+        let running = running_furniture_keys(&items);
+
+        let table_of = |detection_items: &[TextItem]| crate::tables::Table {
+            columns: vec![],
+            rows: vec![],
+            cells: vec![],
+            item_indices: (0..detection_items.len()).collect(),
+            kind: crate::tables::TableKind::Data,
+        };
+
+        // Footer-only candidate: every item is furniture -> vetoed.
+        let footer_items: Vec<TextItem> = (1..=1)
+            .flat_map(|page| {
+                vec![
+                    furniture_item("PROPOSICIÓN CON PUNTO", 85.0, 78.5, page),
+                    furniture_item("EL SENADO", 286.6, 78.5, page),
+                    furniture_item("TITULAR DEL", 85.0, 68.0, page),
+                    furniture_item("A TRAVÉS DE LA", 243.4, 68.0, page),
+                ]
+            })
+            .collect();
+        assert!(is_running_furniture_table(
+            &footer_items,
+            &table_of(&footer_items),
+            &running
+        ));
+
+        // Real table: header row repeats across pages, body rows do not ->
+        // 2 furniture of 6 items (33%) stays under the 80% threshold.
+        let real_items: Vec<TextItem> =
+            header.iter().cloned().chain(data.iter().cloned()).collect();
+        assert!(!is_running_furniture_table(
+            &real_items,
+            &table_of(&real_items),
+            &running
+        ));
+    }
+
+    /// A form template repeated per record carries identical labels at
+    /// identical mid-page coordinates on every page — those are real table
+    /// cells, not furniture. Only the page-edge bands qualify.
+    #[test]
+    fn mid_page_repetition_is_not_furniture() {
+        let mut items = Vec::new();
+        for page in 1..=4 {
+            // Content spanning the page: y 60 (bottom) to 740 (top).
+            items.push(furniture_item("body top", 85.0, 740.0, page));
+            items.push(furniture_item("body bottom", 85.0, 60.0, page));
+            // Form labels repeated dead centre on every page.
+            items.push(furniture_item("Name of creditor", 85.0, 400.0, page));
+            items.push(furniture_item("Amount of claim", 300.0, 400.0, page));
+            // A genuine footer inside the bottom band.
+            items.push(furniture_item("FORM 78 — page footer", 85.0, 70.0, page));
+        }
+
+        let running = running_furniture_keys(&items);
+        assert!(
+            !running.contains(&furniture_key(&furniture_item(
+                "Name of creditor",
+                85.0,
+                400.0,
+                1
+            ))),
+            "mid-page form labels must not be furniture"
+        );
+        assert!(running.contains(&furniture_key(&furniture_item(
+            "FORM 78 — page footer",
+            85.0,
+            70.0,
+            1
+        ))));
+    }
+
+    #[test]
+    fn running_furniture_empty_on_short_documents() {
+        let mut items = Vec::new();
+        for page in 1..=2 {
+            items.push(furniture_item("body", 85.0, 700.0, page));
+            items.push(furniture_item("FOOTER", 85.0, 68.0, page));
+        }
+        assert!(running_furniture_keys(&items).is_empty());
+    }
+
+    /// A page whose text has no vertical span (a single line) gives no
+    /// evidence of where its edges are; its items never become furniture.
+    #[test]
+    fn zero_span_page_contributes_no_furniture() {
+        let mut items = Vec::new();
+        for page in 1..=4 {
+            items.push(furniture_item("ROW LABEL", 85.0, 400.0, page));
+            items.push(furniture_item("ROW VALUE", 300.0, 400.0, page));
+        }
+        assert!(running_furniture_keys(&items).is_empty());
+    }
+
     fn make_item(x: f32, y: f32, page: u32) -> TextItem {
         TextItem {
             text: "A".into(),
@@ -1198,13 +2690,765 @@ mod tests {
             width: 5.0,
             height: 10.0,
             font: String::new(),
+            font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: 10.0,
             page,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
+            is_underline: false,
+            is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: crate::types::ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
+    }
+
+    fn make_item_w(x: f32, y: f32, width: f32, page: u32) -> TextItem {
+        let mut it = make_item(x, y, page);
+        it.width = width;
+        it
+    }
+
+    #[test]
+    fn precomputed_folio_mask_preserves_numeric_table_cells() {
+        let mut items = Vec::new();
+        let mut rects = Vec::new();
+        for row in 0..4 {
+            for column in 0..2 {
+                let mut item = make_item_w(
+                    110.0 + column as f32 * 100.0,
+                    30.0 + row as f32 * 20.0,
+                    20.0,
+                    1,
+                );
+                item.text = (row * 2 + column + 1).to_string();
+                items.push(item);
+                rects.push(PdfRect {
+                    x: 100.0 + column as f32 * 100.0,
+                    y: 20.0 + row as f32 * 20.0,
+                    width: 100.0,
+                    height: 20.0,
+                    page: 1,
+                });
+            }
+        }
+
+        // Simulate document-level folio decisions that would remove every
+        // short numeric item if applied before structural table detection.
+        let removal_mask = vec![true; items.len()];
+        let removed_pages = HashSet::from([1]);
+        let markdown = to_markdown_from_items_with_rects_and_lines(
+            items,
+            MarkdownOptions::default(),
+            &rects,
+            &[],
+            MarkdownDocumentContext {
+                page_thresholds: &HashMap::new(),
+                struct_roles: None,
+                struct_tables: &[],
+                page_count: 1,
+                prefiltered_page_number_pages: Some(&removed_pages),
+                prefiltered_page_number_mask: Some(&removal_mask),
+                precomputed_chart_regions: None,
+            },
+        );
+
+        assert!(markdown.contains("|1|2|"), "{markdown}");
+        assert!(markdown.contains("|7|8|"), "{markdown}");
+    }
+
+    #[test]
+    fn early_layout_excludes_chart_items_before_column_detection() {
+        let mut items = Vec::new();
+        for row in 0..20 {
+            let y = 100.0 + row as f32 * 14.0;
+            items.push(make_item_w(90.0, y, 180.0, 1));
+            items.push(make_item_w(340.0, y, 180.0, 1));
+        }
+        for col in 0..12 {
+            items.push(make_item_w(
+                100.0 + col as f32 * 35.0,
+                620.0 - col as f32 * 4.0,
+                25.0,
+                1,
+            ));
+        }
+
+        let chart_regions = vec![(90.0, 540.0, 530.0, 700.0)];
+        let layout_items = items_outside_chart_regions(&items, &chart_regions);
+
+        assert_eq!(layout_items.len(), 40);
+        assert_eq!(
+            crate::extractor::detect_columns(&layout_items, 1, false).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn chart_padding_claims_labels_but_not_adjacent_prose() {
+        let regions = vec![(100.0, 100.0, 500.0, 300.0)];
+
+        let mut label = make_item_w(220.0, 90.0, 60.0, 1);
+        label.text = "January 2021".into();
+        assert!(item_is_in_chart_region(&label, &regions));
+
+        let mut long_label = make_item_w(210.0, 90.0, 180.0, 1);
+        long_label.text = "Share of respondents by employment sector".into();
+        assert!(item_is_in_chart_region(&long_label, &regions));
+
+        let mut caption = make_item_w(120.0, 310.0, 350.0, 1);
+        caption.text = "Figure 3. Results across every survey phase and sector".into();
+        assert!(item_is_in_chart_region(&caption, &regions));
+
+        let mut wide_short_prose = make_item_w(120.0, 90.0, 350.0, 1);
+        wide_short_prose.text = "Results improved across all sectors".into();
+        assert!(!item_is_in_chart_region(&wide_short_prose, &regions));
+
+        let mut prose = make_item_w(120.0, 90.0, 350.0, 1);
+        prose.text = "This paragraph continues below the chart into the next prose column".into();
+        assert!(!item_is_in_chart_region(&prose, &regions));
+
+        let mut bullet = make_item_w(340.0, 90.0, 5.0, 1);
+        bullet.text = "•".into();
+        assert!(!item_is_in_chart_region(&bullet, &regions));
+    }
+
+    #[test]
+    fn chart_page_detects_two_short_prose_columns() {
+        let mut items = Vec::new();
+        for row in 0..12 {
+            let y = 100.0 + row as f32 * 14.0;
+            let mut left = make_item_w(90.0, y, 180.0, 1);
+            left.text = "A complete prose line in the left column".into();
+            items.push(left);
+            let mut right = make_item_w(340.0, y, 180.0, 1);
+            right.text = "A complete prose line in the right column".into();
+            items.push(right);
+        }
+
+        let split = chart_page_prose_column_split(&items).unwrap();
+        assert!(split > 200.0 && split < 300.0);
+    }
+
+    #[test]
+    fn chart_page_rejects_non_overlapping_prose_anchors() {
+        let mut items = Vec::new();
+        for row in 0..8 {
+            let mut left = make_item_w(90.0, 100.0 + row as f32 * 14.0, 180.0, 1);
+            left.text = "A complete prose line in the upper column".into();
+            items.push(left);
+            let mut right = make_item_w(340.0, 300.0 + row as f32 * 14.0, 180.0, 1);
+            right.text = "A complete prose line in the lower column".into();
+            items.push(right);
+        }
+
+        assert_eq!(chart_page_prose_column_split(&items), None);
+    }
+
+    #[test]
+    fn chart_separator_must_span_both_prose_columns() {
+        let split_x = 280.0;
+
+        assert!(chart_spans_prose_split(
+            (100.0, 300.0, 500.0, 500.0),
+            split_x
+        ));
+        assert!(!chart_spans_prose_split(
+            (90.0, 300.0, 260.0, 500.0),
+            split_x
+        ));
+        assert!(!chart_spans_prose_split(
+            (300.0, 300.0, 520.0, 500.0),
+            split_x
+        ));
+    }
+
+    #[test]
+    fn chart_prose_order_survives_physical_gutter_detection() {
+        let mut items = Vec::new();
+        for row in 0..20 {
+            let y = 760.0 - row as f32 * 13.0;
+            let mut left = make_item_w(90.0, y, 100.0, 1);
+            left.text = format!("Left prose line {row} has several words");
+            items.push(left);
+            let mut right = make_item_w(340.0, y, 100.0, 1);
+            right.text = format!("Right prose line {row} has several words");
+            items.push(right);
+        }
+        assert!(
+            !split_side_by_side(&items).is_empty(),
+            "fixture must exercise the physical-gutter path"
+        );
+
+        // Connected, variably sized bars form a full-width chart separator.
+        let mut rects = vec![PdfRect {
+            x: 80.0,
+            y: 280.0,
+            width: 440.0,
+            height: 150.0,
+            page: 1,
+        }];
+        for (x, height) in [(120.0, 55.0), (210.0, 90.0), (300.0, 70.0), (390.0, 115.0)] {
+            rects.push(PdfRect {
+                x,
+                y: 280.0,
+                width: 45.0,
+                height,
+                page: 1,
+            });
+        }
+        // A second connected family keeps the bar cluster above the detector's
+        // minimum while retaining data-driven height variation.
+        for (x, y, height) in [
+            (120.0, 332.0, 45.0),
+            (210.0, 367.0, 55.0),
+            (300.0, 347.0, 35.0),
+            (390.0, 392.0, 30.0),
+        ] {
+            rects.push(PdfRect {
+                x,
+                y,
+                width: 45.0,
+                height,
+                page: 1,
+            });
+        }
+
+        // Detection/input order is deliberately right before left. Only the
+        // chart-scoped logical order can put these blocks into prose-column
+        // order after the physical bands have already scoped table detection.
+        let mut right_image = make_item(340.0, 650.0, 1);
+        right_image.text = "[Image: RightFigure]".into();
+        right_image.item_type = crate::types::ItemType::Image;
+        items.push(right_image);
+        let mut left_image = make_item(90.0, 600.0, 1);
+        left_image.text = "[Image: LeftFigure]".into();
+        left_image.item_type = crate::types::ItemType::Image;
+        items.push(left_image);
+
+        let options = MarkdownOptions {
+            include_images: true,
+            ..MarkdownOptions::default()
+        };
+        let markdown = to_markdown_from_items_with_rects(items, options, &rects);
+        let left_last = markdown.find("Left prose line 19").unwrap();
+        let right_first = markdown.find("Right prose line 0").unwrap();
+        assert!(
+            left_last < right_first,
+            "chart prose must read down the left column before the right even when table detection found physical bands:\n{markdown}"
+        );
+        let left_image = markdown.find("LeftFigure").unwrap();
+        let right_image = markdown.find("RightFigure").unwrap();
+        assert!(
+            left_image < right_image,
+            "chart blocks must retain column order when physical bands are present:\n{markdown}"
+        );
+    }
+
+    #[test]
+    fn weave_and_list_projections_are_rejected() {
+        // Tiny 2-column weave: prose continues down each column across an
+        // empty cell, so lookback (not just adjacent rows) must connect it.
+        let tiny_weave = crate::tables::Table::new(
+            vec![70.0, 300.0],
+            vec![320.0, 300.0, 280.0],
+            vec![
+                vec![
+                    "spawning aggregations, 45% were unknown, 33% were".into(),
+                    "of exploited grouper aggregations globally, as noted by".into(),
+                ],
+                vec![
+                    "".into(),
+                    "fisher interviews, monitoring, or underwater surveys done".into(),
+                ],
+                vec![
+                    "decreasing, and 5% were already gone from the region".into(),
+                    "records collected over the previous two survey decades".into(),
+                ],
+            ],
+            (0..5).collect(),
+        );
+        assert!(is_parallel_prose_table(&tiny_weave), "tiny grid weave");
+
+        // Wide projection: continuations outnumber rows and flow in 3+
+        // columns of long prose fragments.
+        let wide_weave = crate::tables::Table::new(
+            vec![60.0, 160.0, 260.0, 360.0, 460.0],
+            vec![400.0, 380.0, 360.0, 340.0, 320.0, 300.0],
+            vec![
+                vec![
+                    "check all of your emotions carefully before".into(),
+                    "causes strong visceral reactions and it".into(),
+                    "if a claim ever seems clearly designed to".into(),
+                    "chapters we are still reviewing in the".into(),
+                    "".into(),
+                ],
+                vec![
+                    "sharing anything further with your own".into(),
+                    "should always give you pause and reason".into(),
+                    "provoke rather than genuinely inform the".into(),
+                    "focusing our efforts on researching a".into(),
+                    "".into(),
+                ],
+                vec![
+                    "closest colleagues and all of their many".into(),
+                    "before finally deciding to pass along the".into(),
+                    "reader it deserves careful scrutiny and".into(),
+                    "wicked problem, and these are certainly".into(),
+                    "".into(),
+                ],
+                vec![
+                    "networks of trusted contacts and friends".into(),
+                    "message along to anyone else who asks it".into(),
+                    "verification through multiple separate and".into(),
+                    "not simple topics anyone can summarize".into(),
+                    "".into(),
+                ],
+                vec![
+                    "who might spread it much further still and".into(),
+                    "in the entire organization or well beyond".into(),
+                    "independent sources of record and archive".into(),
+                    "quickly for the busy executive readers".into(),
+                    "".into(),
+                ],
+                vec![
+                    "without ever checking any part of it first".into(),
+                    "the original recipients list and beyond it".into(),
+                    "before acting on the contents of anything".into(),
+                    "who needs only the short version of this".into(),
+                    "".into(),
+                ],
+            ],
+            (0..24).collect(),
+        );
+        assert!(
+            is_parallel_prose_table(&wide_weave),
+            "continuation-dominated"
+        );
+
+        // Reference-table protection: wrapped short citation fragments
+        // continue in every column but never read as running text
+        // (long_prose = 0) — must stay a table.
+        let reference_grid = crate::tables::Table::new(
+            vec![70.0, 220.0, 370.0],
+            vec![400.0, 380.0, 360.0, 340.0, 320.0, 300.0],
+            vec![
+                vec![
+                    "§1.338(h)(10)-1(f)".into(),
+                    "§1.331-1(d), and".into(),
+                    "§1.331-1T(d) and".into(),
+                ],
+                vec!["".into(), "§1.332-6".into(), "§1.332-6T".into()],
+                vec!["§1.382-2T(h)(4)(vi)".into(), "section".into(), "11T".into()],
+                vec!["§1.382-8(a)".into(), "and (c)(5) of this".into(), "".into()],
+                vec![
+                    "The last sentence of".into(),
+                    "paragraph (a)(2)(ii)".into(),
+                    "paragraph (a) of".into(),
+                ],
+                vec![
+                    "§1.382-2T(h)(4)(vi)(B)".into(),
+                    "section".into(),
+                    "11T".into(),
+                ],
+            ],
+            (0..16).collect(),
+        );
+        assert!(!is_parallel_prose_table(&reference_grid), "reference grid");
+
+        // Citation block over-fragmented into a wide word grid.
+        let word_grid = crate::tables::Table::new(
+            vec![60.0, 130.0, 200.0, 270.0, 340.0, 410.0],
+            vec![400.0, 380.0, 360.0, 340.0],
+            vec![
+                vec![
+                    "Songfang".into(),
+                    "Huang,".into(),
+                    "and".into(),
+                    "Fei Huang.".into(),
+                    "2023.".into(),
+                    "Rrhf:".into(),
+                ],
+                vec![
+                    "Rank".into(),
+                    "responses".into(),
+                    "to align".into(),
+                    "language".into(),
+                    "models".into(),
+                    "with".into(),
+                ],
+                vec![
+                    "human".into(),
+                    "feedback".into(),
+                    "without".into(),
+                    "tears.".into(),
+                    "arXiv".into(),
+                    "preprint".into(),
+                ],
+                vec![
+                    "arXiv:2304".into(),
+                    "".into(),
+                    "".into(),
+                    "".into(),
+                    "".into(),
+                    "".into(),
+                ],
+            ],
+            (0..19).collect(),
+        );
+        assert!(is_parallel_prose_table(&word_grid), "word-fragment grid");
+
+        // Numbered list projected onto marker|text columns.
+        let marker_list = crate::tables::Table::new(
+            vec![70.0, 100.0],
+            vec![400.0, 380.0, 360.0, 340.0],
+            vec![
+                vec!["1.".into(), "Edward Bernays".into()],
+                vec!["2.".into(), "Wikipedia. Public Relations".into()],
+                vec!["3.".into(), "Pinterest. Retrieved June 10, 2021.".into()],
+                vec!["4.".into(), "Museum of Public Relations".into()],
+            ],
+            (0..8).collect(),
+        );
+        assert!(is_parallel_prose_table(&marker_list), "ordinal marker list");
+
+        // Numbered list items woven beside sidebar fragments.
+        let prefixed_list = crate::tables::Table::new(
+            vec![70.0, 340.0],
+            vec![400.0, 380.0, 360.0, 340.0],
+            vec![
+                vec![
+                    "1. Restructuring the administration of the program".into(),
+                    "".into(),
+                ],
+                vec![
+                    "2. Shifting priorities for resource allocation".into(),
+                    "freedom to decide".into(),
+                ],
+                vec![
+                    "3. Pursuing regulatory reform across agencies".into(),
+                    "".into(),
+                ],
+                vec![
+                    "4. Reinvesting savings from system reorganization".into(),
+                    "control over resources".into(),
+                ],
+            ],
+            (0..6).collect(),
+        );
+        assert!(
+            is_parallel_prose_table(&prefixed_list),
+            "ordinal-prefixed list"
+        );
+
+        // Ranked data tables use bare numbers (no list-marker punctuation)
+        // and stay tables.
+        let ranked = crate::tables::Table::new(
+            vec![70.0, 340.0],
+            vec![400.0, 380.0, 360.0, 340.0],
+            vec![
+                vec!["1".into(), "Golden Eagle Aviation".into()],
+                vec!["2".into(), "Northern Star Freight".into()],
+                vec!["3".into(), "Pacific Rim Cargo".into()],
+                vec!["4".into(), "Atlas Air Services".into()],
+            ],
+            (0..8).collect(),
+        );
+        assert!(!is_parallel_prose_table(&ranked), "ranked table");
+    }
+
+    #[test]
+    fn parallel_prose_table_is_rejected_but_real_table_is_preserved() {
+        assert!(merged_retry_skips_body_font(true, false));
+        assert!(!merged_retry_skips_body_font(true, true));
+        assert!(!merged_retry_skips_body_font(false, true));
+
+        assert!(looks_like_numbered_section_heading(
+            "9.5. Adapting to the New Normal: Changing Business Models"
+        ));
+        assert!(!looks_like_numbered_section_heading(
+            "2024 revenue by business segment"
+        ));
+
+        let prose = crate::tables::Table::new(
+            vec![90.0, 340.0],
+            vec![320.0, 300.0, 280.0, 260.0],
+            vec![
+                vec![
+                    "This section investigates the impact of public health measures".into(),
+                    "course of the research period and the impacts continued".into(),
+                ],
+                vec![
+                    "measures on business operations during the national lockdown".into(),
+                    "".into(),
+                ],
+                vec![
+                    "asked about their expectations for business recovery".into(),
+                    "felt by firms working under reduced operating conditions".into(),
+                ],
+                vec![
+                    "respondents described their expectations for business recovery".into(),
+                    "while many other businesses remained temporarily closed".into(),
+                ],
+            ],
+            (0..7).collect(),
+        );
+        assert!(is_parallel_prose_table(&prose));
+
+        let data = crate::tables::Table::new(
+            vec![90.0, 340.0],
+            vec![300.0, 280.0, 260.0],
+            vec![
+                vec!["Sector".into(), "Revenue".into()],
+                vec!["Tourism".into(), "$1,240".into()],
+                vec!["Agriculture".into(), "$980".into()],
+            ],
+            (0..6).collect(),
+        );
+        assert!(!is_parallel_prose_table(&data));
+
+        // A compact header row atop parallel prose columns: cross-row prose
+        // continuations outnumber the rows, so the header cannot save the
+        // candidate — this is page prose with two short fragments on top.
+        let headed_parallel_prose = crate::tables::Table::new(
+            vec![90.0, 340.0],
+            vec![340.0, 320.0, 300.0, 280.0, 260.0],
+            vec![
+                vec!["June 2023".into(), "Page 5".into()],
+                vec![
+                    "the committee reviewed the proposal and decided that the".into(),
+                    "funding for the second phase would continue subject to the".into(),
+                ],
+                vec![
+                    "implementation schedule should be extended by another".into(),
+                    "quarterly reviews established during the first phase of the".into(),
+                ],
+                vec![
+                    "six months to accommodate the revised procurement rules".into(),
+                    "".into(),
+                ],
+                vec![
+                    "adopted at the previous meeting of the governing board".into(),
+                    "participating institutions across the partner regions".into(),
+                ],
+            ],
+            (0..10).collect(),
+        );
+        assert!(is_parallel_prose_table(&headed_parallel_prose));
+
+        let headed_text_table = crate::tables::Table::new(
+            vec![90.0, 340.0],
+            vec![320.0, 300.0, 280.0],
+            vec![
+                vec!["Program".into(), "Description".into()],
+                vec![
+                    "Business recovery and continuity planning support".into(),
+                    "Provides tailored guidance to firms affected by disruptions".into(),
+                ],
+                vec![
+                    "Regional market access and supplier development".into(),
+                    "Connects eligible producers with new distribution partners".into(),
+                ],
+            ],
+            (0..6).collect(),
+        );
+        assert!(!is_parallel_prose_table(&headed_text_table));
+
+        let sparse_first_row_then_compact_body = crate::tables::Table::new(
+            vec![90.0, 340.0],
+            vec![340.0, 320.0, 300.0, 280.0],
+            vec![
+                vec![
+                    "This introductory prose fragment occupies only the left column".into(),
+                    "".into(),
+                ],
+                vec!["short".into(), "row".into()],
+                vec![
+                    "continuation text remains aligned with the left prose anchor".into(),
+                    "parallel text continues down the right prose column".into(),
+                ],
+                vec![
+                    "another wrapped fragment follows in the left column".into(),
+                    "while its neighboring prose fragment continues on the right".into(),
+                ],
+            ],
+            (0..8).collect(),
+        );
+        assert!(is_parallel_prose_table(&sparse_first_row_then_compact_body));
+
+        let headerless_description_table = crate::tables::Table::new(
+            vec![90.0, 340.0],
+            vec![320.0, 300.0, 280.0],
+            vec![
+                vec![
+                    "community preparedness and emergency response planning".into(),
+                    "provides detailed support for local continuity programs".into(),
+                ],
+                vec![
+                    "regional supplier and market development assistance".into(),
+                    "connects eligible producers with new distribution partners".into(),
+                ],
+                vec![
+                    "financial continuity and business recovery program".into(),
+                    "offers tailored guidance to firms affected by disruptions".into(),
+                ],
+            ],
+            (0..6).collect(),
+        );
+        assert!(!is_parallel_prose_table(&headerless_description_table));
+
+        let sparse_rowspanning_description_table = crate::tables::Table::new(
+            vec![90.0, 340.0],
+            vec![360.0, 340.0, 320.0, 300.0, 280.0, 260.0],
+            vec![
+                vec![
+                    "community preparedness and emergency response planning support".into(),
+                    "provides detailed support for local continuity program delivery".into(),
+                ],
+                vec![
+                    "through coordinated training and regional response exercises".into(),
+                    "".into(),
+                ],
+                vec![
+                    "".into(),
+                    "with technical assistance for participating local organizations".into(),
+                ],
+                vec![
+                    "regional supplier and market development assistance program".into(),
+                    "connects eligible producers with new distribution opportunities".into(),
+                ],
+                vec![
+                    "through procurement guidance and tailored readiness workshops".into(),
+                    "".into(),
+                ],
+                vec![
+                    "".into(),
+                    "while expanding access to qualified commercial partners".into(),
+                ],
+            ],
+            (0..8).collect(),
+        );
+        assert!(!is_parallel_prose_table(
+            &sparse_rowspanning_description_table
+        ));
+    }
+
+    /// 4-row × 2-col ruled grid from x=100..300 (rows every 20pt from y=600).
+    fn ruled_cluster_rects() -> Vec<PdfRect> {
+        let mut rects = Vec::new();
+        for row in 0..4 {
+            for col in 0..2 {
+                rects.push(PdfRect {
+                    x: 100.0 + col as f32 * 100.0,
+                    y: 600.0 + row as f32 * 20.0,
+                    width: 100.0,
+                    height: 20.0,
+                    page: 1,
+                });
+            }
+        }
+        rects
+    }
+
+    #[test]
+    fn band_veto_cluster_ruled_across_boundary() {
+        // Rects on both sides of the boundary and cell text on both sides,
+        // row-aligned → the split cuts straight through a drawn table.
+        let mut rects = ruled_cluster_rects();
+        for r in &mut rects {
+            r.width = 150.0; // right column now spans 250..400, past b=320
+        }
+        let mut items = Vec::new();
+        for row in 0..4 {
+            let y = 610.0 + row as f32 * 20.0;
+            items.push(make_item_w(110.0, y, 80.0, 1)); // left cells
+            items.push(make_item_w(330.0, y, 30.0, 1)); // right cells past b
+        }
+        assert!(rect_cluster_spans_band_boundary(
+            &items,
+            &rects,
+            1,
+            &[(90.0, 320.0), (320.0, 500.0)]
+        ));
+    }
+
+    #[test]
+    fn band_veto_ignores_spanning_figure() {
+        // A figure's rects span the boundary at the top of the page, but the
+        // far side is dominated by column prose below it → keep the split.
+        let mut rects = ruled_cluster_rects(); // y 600..680
+        for r in &mut rects {
+            r.width = 150.0; // spans past b=320
+        }
+        let mut items = Vec::new();
+        // A few figure labels inside the cluster, aligned rows.
+        for row in 0..4 {
+            let y = 610.0 + row as f32 * 20.0;
+            items.push(make_item_w(110.0, y, 40.0, 1));
+            items.push(make_item_w(330.0, y, 20.0, 1));
+        }
+        // Dense prose column far below the figure (outside cluster y-range).
+        let mut y = 100.0;
+        while y < 560.0 {
+            items.push(make_item_w(330.0, y, 140.0, 1));
+            y += 12.0;
+        }
+        assert!(!rect_cluster_spans_band_boundary(
+            &items,
+            &rects,
+            1,
+            &[(90.0, 320.0), (320.0, 500.0)]
+        ));
+    }
+
+    #[test]
+    fn band_veto_borderless_columns_continue_rows() {
+        // Rects end at x=300 (just short of b=320); cell-like text at x=340
+        // aligns with every grid row → the "gutter" is inside the table.
+        let rects = ruled_cluster_rects();
+        let mut items = Vec::new();
+        for row in 0..4 {
+            let y = 610.0 + row as f32 * 20.0;
+            items.push(make_item_w(110.0, y, 80.0, 1)); // label cells
+            items.push(make_item_w(340.0, y, 30.0, 1)); // borderless column
+        }
+        assert!(rect_cluster_spans_band_boundary(
+            &items,
+            &rects,
+            1,
+            &[(90.0, 320.0), (320.0, 500.0)]
+        ));
+    }
+
+    #[test]
+    fn band_veto_ignores_prose_column() {
+        // Dense prose right of the boundary: wide lines, three per grid row,
+        // mostly not row-aligned → keep the side-by-side split.
+        let rects = ruled_cluster_rects();
+        let mut items = Vec::new();
+        for row in 0..4 {
+            items.push(make_item_w(110.0, 610.0 + row as f32 * 20.0, 80.0, 1));
+        }
+        let mut y = 602.0;
+        while y < 680.0 {
+            items.push(make_item_w(340.0, y, 200.0, 1)); // full-width prose lines
+            y += 7.0;
+        }
+        assert!(!rect_cluster_spans_band_boundary(
+            &items,
+            &rects,
+            1,
+            &[(90.0, 320.0), (320.0, 500.0)]
+        ));
     }
 
     #[test]

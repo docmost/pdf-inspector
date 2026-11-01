@@ -349,54 +349,6 @@ pub(crate) fn find_row_index(rows: &[f32], y: f32) -> Option<usize> {
         .map(|(idx, _)| idx)
 }
 
-/// Join cell items with subscript/superscript-aware spacing
-/// Same logic as TextLine::text() but for table cells
-pub(crate) fn join_cell_items(items: &[&TextItem]) -> String {
-    let mut result = String::new();
-
-    for (i, item) in items.iter().enumerate() {
-        let text = item.text.trim();
-        if text.is_empty() {
-            continue;
-        }
-
-        if result.is_empty() {
-            result.push_str(text);
-        } else {
-            let prev_item = items[i - 1];
-
-            // Don't add space before/after hyphens
-            let prev_ends_with_hyphen = result.ends_with('-');
-            let curr_is_hyphen = text == "-";
-            let curr_starts_with_hyphen = text.starts_with('-');
-
-            // Detect subscript/superscript: smaller font size and/or Y offset
-            let font_ratio = item.font_size / prev_item.font_size;
-            let reverse_font_ratio = prev_item.font_size / item.font_size;
-            let y_diff = (item.y - prev_item.y).abs();
-
-            // Current item is subscript/superscript (smaller than previous)
-            let is_sub_super = font_ratio < 0.85 && y_diff > 1.0;
-            // Previous item was subscript/superscript (returning to normal size)
-            let was_sub_super = reverse_font_ratio < 0.85 && y_diff > 1.0;
-
-            if prev_ends_with_hyphen
-                || curr_is_hyphen
-                || curr_starts_with_hyphen
-                || is_sub_super
-                || was_sub_super
-            {
-                result.push_str(text);
-            } else {
-                result.push(' ');
-                result.push_str(text);
-            }
-        }
-    }
-
-    result
-}
-
 /// Recover a header row for small-font tables by looking at body-font items
 /// just above the table's first row.
 ///
@@ -430,7 +382,8 @@ pub(crate) fn recover_header_row(
         .iter()
         .enumerate()
         .filter(|(_, item)| {
-            item.font_size > small_font_threshold
+            !item.is_strikeout
+                && item.font_size > small_font_threshold
                 && item.y > first_row_y
                 && item.y <= first_row_y + row_gap_limit
         })
@@ -510,12 +463,25 @@ mod tests {
             width: text.len() as f32 * font_size * 0.5,
             height: font_size,
             font: "TestFont".to_string(),
+            font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size,
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
+            is_underline: false,
+            is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
     }
 
@@ -595,7 +561,7 @@ mod tests {
         let items: Vec<(usize, &TextItem)> = vec![];
         assert_eq!(
             find_column_boundaries(&items, TableDetectionMode::SmallFont),
-            vec![]
+            Vec::<f32>::new()
         );
     }
 
@@ -652,7 +618,7 @@ mod tests {
     #[test]
     fn test_find_row_boundaries_empty() {
         let items: Vec<(usize, &TextItem)> = vec![];
-        assert_eq!(find_row_boundaries(&items), vec![]);
+        assert_eq!(find_row_boundaries(&items), Vec::<f32>::new());
     }
 
     #[test]
@@ -704,44 +670,6 @@ mod tests {
         assert_eq!(rows.len(), 1);
     }
 
-    // --- join_cell_items ---
-
-    #[test]
-    fn test_join_cell_items_single_item() {
-        let item = make_item("Hello", 100.0, 500.0, 10.0);
-        assert_eq!(join_cell_items(&[&item]), "Hello");
-    }
-
-    #[test]
-    fn test_join_cell_items_multiple_spaced() {
-        let a = make_item("Hello", 100.0, 500.0, 10.0);
-        let b = make_item("World", 150.0, 500.0, 10.0);
-        assert_eq!(join_cell_items(&[&a, &b]), "Hello World");
-    }
-
-    #[test]
-    fn test_join_cell_items_hyphen_no_space() {
-        let a = make_item("pre", 100.0, 500.0, 10.0);
-        let b = make_item("-", 120.0, 500.0, 10.0);
-        let c = make_item("fix", 130.0, 500.0, 10.0);
-        assert_eq!(join_cell_items(&[&a, &b, &c]), "pre-fix");
-    }
-
-    #[test]
-    fn test_join_cell_items_subscript_no_space() {
-        let a = make_item("H", 100.0, 500.0, 12.0);
-        let b = make_item("2", 110.0, 497.0, 8.0); // smaller font, Y offset
-        assert_eq!(join_cell_items(&[&a, &b]), "H2");
-    }
-
-    #[test]
-    fn test_join_cell_items_empty_items_skipped() {
-        let a = make_item("Hello", 100.0, 500.0, 10.0);
-        let b = make_item("  ", 120.0, 500.0, 10.0);
-        let c = make_item("World", 150.0, 500.0, 10.0);
-        assert_eq!(join_cell_items(&[&a, &b, &c]), "Hello World");
-    }
-
     // --- recover_header_row ---
 
     #[test]
@@ -782,6 +710,31 @@ mod tests {
         let rows_before = table.rows.len();
         recover_header_row(&mut table, &all_items, 9.0);
         assert_eq!(table.rows.len(), rows_before);
+    }
+
+    #[test]
+    fn test_recover_header_row_skips_strikeout_candidates() {
+        let mut old_col1 = make_item("Old Col1", 100.0, 520.0, 12.0);
+        old_col1.is_strikeout = true;
+        let mut old_col2 = make_item("Old Col2", 200.0, 520.0, 12.0);
+        old_col2.is_strikeout = true;
+        let all_items = vec![
+            old_col1,
+            old_col2,
+            make_item("A", 100.0, 500.0, 8.0),
+            make_item("B", 200.0, 500.0, 8.0),
+        ];
+        let mut table = Table {
+            columns: vec![100.0, 200.0],
+            rows: vec![500.0, 480.0],
+            cells: vec![vec!["A".into(), "B".into()], vec!["C".into(), "D".into()]],
+            item_indices: vec![2, 3],
+            kind: TableKind::Data,
+        };
+
+        recover_header_row(&mut table, &all_items, 9.0);
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.cells[0], vec!["A", "B"]);
     }
 
     #[test]
@@ -864,10 +817,23 @@ mod tests {
                         font_size: 7.0,
                         height: 7.0,
                         font: String::new(),
+                        font_tag: String::new(),
+                        legacy_symbol_rewrite: false,
                         is_bold: false,
                         is_italic: false,
+                        font_weight: None,
+                        bold_source: None,
+                        fixed_pitch: None,
+                        fill_color: None,
+                        stroke_color: None,
+                        render_mode: None,
+                        is_underline: false,
+                        is_strikeout: false,
+                        rotation: 0.0,
+                        advance_known: true,
                         item_type: ItemType::Text,
                         mcid: None,
+                        baseline_shift: 0.0,
                         page: 1,
                     },
                 ));
@@ -900,10 +866,23 @@ mod tests {
                         font_size: 10.0,
                         height: 7.0,
                         font: String::new(),
+                        font_tag: String::new(),
+                        legacy_symbol_rewrite: false,
                         is_bold: false,
                         is_italic: false,
+                        font_weight: None,
+                        bold_source: None,
+                        fixed_pitch: None,
+                        fill_color: None,
+                        stroke_color: None,
+                        render_mode: None,
+                        is_underline: false,
+                        is_strikeout: false,
+                        rotation: 0.0,
+                        advance_known: true,
                         item_type: ItemType::Text,
                         mcid: None,
+                        baseline_shift: 0.0,
                         page: 1,
                     },
                 ));

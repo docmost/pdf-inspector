@@ -131,10 +131,11 @@ pub(crate) fn format_list_item(text: &str) -> String {
         if let Some(rest) = trimmed.strip_prefix(*bullet) {
             return format!("- {}", rest.trim_start());
         }
-        // Bullet inside a leading bold/italic run (e.g. "**● Label:** rest").
-        // The run wraps both the marker and the following label because both
-        // use a bold font in the PDF.
-        for wrapper in ["**", "*"] {
+        // Bullet inside a leading style run (e.g. "**● Label:** rest" or
+        // "<u>● Label</u>"). The run wraps both the marker and the following
+        // label because both carry the style in the PDF. The marker must move
+        // outside the wrapper so markdown still sees a list item.
+        for wrapper in ["**", "*", "<u>"] {
             if let Some(after_open) = trimmed.strip_prefix(wrapper) {
                 if let Some(rest) = after_open.strip_prefix(*bullet) {
                     return format!("- {}{}", wrapper, rest.trim_start());
@@ -202,9 +203,42 @@ pub(crate) fn is_code_like(text: &str) -> bool {
     false
 }
 
+/// True when a line's text is essentially all monospace (≥90% by character
+/// count). Code lines are wholly monospace; anything less is prose carrying
+/// mono-styled fragments — a URL sidebar, or a sentence quoting an inline
+/// code literal — and fencing it would split paragraphs mid-sentence.
+/// Any-item matching was safe only while items carried opaque font resource
+/// names that never matched the monospace patterns; items now carry real
+/// family names.
+pub(crate) fn line_is_monospace(line: &crate::types::TextLine) -> bool {
+    let mut monospace_chars = 0usize;
+    let mut total_chars = 0usize;
+    for item in &line.items {
+        let text = item.text.trim();
+        let chars = text.chars().count();
+        total_chars += chars;
+        // Hyperlinks and underlined text set in a mono face are link
+        // styling, not code — a URL sidebar must not fence lyric lines.
+        let looks_like_link = item.is_underline
+            || matches!(item.item_type, crate::types::ItemType::Link(_))
+            || text.contains("://")
+            || text.starts_with("www.");
+        if is_monospace_font(&item.font) && !looks_like_link {
+            monospace_chars += chars;
+        }
+    }
+    total_chars > 0 && monospace_chars * 10 >= total_chars * 9
+}
+
 /// Check if font name indicates monospace
 pub(crate) fn is_monospace_font(font_name: &str) -> bool {
     let lower = font_name.to_lowercase();
+    // "Monotype" is a foundry prefix on proportional faces (Monotype
+    // Corsiva, Monotype Garamond) — it must not satisfy the generic "mono"
+    // token below.
+    if lower.contains("monotype") {
+        return false;
+    }
     let patterns = [
         "courier",
         "consolas",
@@ -230,9 +264,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn monotype_foundry_faces_are_not_monospace() {
+        // "Monotype" is a foundry prefix on proportional faces; the generic
+        // "mono" token must not classify them as code fonts.
+        assert!(!is_monospace_font("MonotypeCorsiva"));
+        assert!(!is_monospace_font("ABCDEF+Monotype-Garamond"));
+        assert!(is_monospace_font("RobotoMono-Regular"));
+        assert!(is_monospace_font("PTMono"));
+        assert!(is_monospace_font("Courier"));
+    }
+
+    #[test]
     fn format_list_item_plain_bullet() {
         assert_eq!(format_list_item("● Item"), "- Item");
         assert_eq!(format_list_item("• Item"), "- Item");
+    }
+
+    #[test]
+    fn format_list_item_bullet_inside_underline() {
+        // Fully-underlined bullet line: the marker must move outside the
+        // <u> wrapper so markdown still renders a list item.
+        assert_eq!(format_list_item("<u>● Item text</u>"), "- <u>Item text</u>");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "pdf-inspector-napi"
-version = "0.2.0"
+version = "1.25.2"
 edition = "2021"
 
 [lib]
@@ -13,6 +13,11 @@ napi-derive = "3.0.0"
 
 [build-dependencies]
 napi-build = "2"
+
+[features]
+# Off in the published addon: Docmost does not call it, and it adds about 200
+# crates (TLS, ONNX, image codecs) and C builds to every platform binary.
+ocr = ["pdf-inspector/ocr"]
 
 [profile.release]
 lto = true

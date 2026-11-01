@@ -1,9 +1,9 @@
 //! Line preprocessing: heading merging, drop cap handling, and repeated line removal.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::structure_tree::StructRole;
-use crate::types::TextLine;
+use crate::types::{TextItem, TextLine};
 
 use super::analysis::detect_header_level;
 
@@ -42,7 +42,12 @@ fn effective_heading_level(
 
     // Fall back to font-size heuristic
     let font = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
-    detect_header_level(font, base_size, heading_tiers)
+    detect_header_level(
+        font,
+        base_size,
+        heading_tiers,
+        crate::markdown::analysis::line_is_mostly_bold(line),
+    )
 }
 
 /// Merge consecutive heading lines at the same level into a single line.
@@ -86,6 +91,41 @@ pub(crate) fn merge_heading_lines(
         } else {
             false
         };
+
+        // Bold headings at body font size never reach a tier, so wrapped ones
+        // split into two output headings ("…of wood pellets and cost" /
+        // "structure in Japan"). Merge a fully-bold line into the previous
+        // fully-bold line when it reads as a wrap continuation: starts
+        // lowercase, tiny Y gap, and the previous line has no terminal
+        // punctuation. Kept deliberately narrow — bold list labels and bold
+        // sentences start with markers or capitals and are unaffected.
+        let should_merge = should_merge
+            || if let Some(prev) = result.last() {
+                let all_bold = |l: &TextLine| {
+                    !l.items.is_empty() && l.items.iter().all(|i: &TextItem| i.is_bold)
+                };
+                let prev_text = prev.text();
+                let prev_trim = prev_text.trim_end();
+                let curr_text = line.text();
+                let curr_trim = curr_text.trim();
+                let y_gap = prev.y - line.y;
+                // Both lines must be tier-less: a tiered/tagged bold heading
+                // followed by bold body text must not absorb it.
+                line_level.is_none()
+                    && effective_heading_level(prev, base_size, heading_tiers, struct_roles)
+                        .is_none()
+                    && prev.page == line.page
+                    && all_bold(prev)
+                    && all_bold(&line)
+                    && y_gap > 0.0
+                    && y_gap < line_font * 1.6
+                    && curr_trim.chars().next().is_some_and(|c| c.is_lowercase())
+                    && !prev_trim.ends_with(['.', ':', ';', '!', '?'])
+                    && prev_trim.split_whitespace().count() + curr_trim.split_whitespace().count()
+                        <= 20
+            } else {
+                false
+            };
 
         if should_merge {
             // Append this line's items to the previous line
@@ -177,6 +217,8 @@ pub(crate) fn merge_drop_caps(lines: Vec<TextLine>, base_size: f32) -> Vec<TextL
                 if let Some(first_item) = result[idx].items.first_mut() {
                     let prev_text = first_item.text.trim().to_string();
                     first_item.text = format!("{}{}", drop_char, prev_text);
+                    first_item.legacy_symbol_rewrite |=
+                        line.items.iter().any(|item| item.legacy_symbol_rewrite);
                 }
             }
             // Don't add the drop cap line itself
@@ -187,342 +229,6 @@ pub(crate) fn merge_drop_caps(lines: Vec<TextLine>, base_size: f32) -> Vec<TextL
     }
 
     result
-}
-
-/// Normalize whitespace in a string for comparison: trim and collapse internal runs of whitespace.
-fn normalize_whitespace(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Normalize text for frequency comparison: collapse whitespace and strip leading/trailing
-/// digit sequences (page numbers). E.g., "Chapter 3 — Page 5" and "Chapter 3 — Page 6"
-/// both normalize to "Chapter 3 — Page".
-fn normalize_for_comparison(s: &str) -> String {
-    let ws = normalize_whitespace(s);
-    let trimmed = ws
-        .trim_start_matches(|c: char| c.is_ascii_digit())
-        .trim_start();
-    let trimmed = trimmed
-        .trim_end_matches(|c: char| c.is_ascii_digit())
-        .trim_end();
-    trimmed.to_string()
-}
-
-/// Returns true if the line looks like a list item or heading (should not be stripped).
-fn is_structural_line(text: &str) -> bool {
-    let t = text.trim_start();
-    t.starts_with('#')
-        || t.starts_with("- ")
-        || t.starts_with("* ")
-        || t.starts_with("• ")
-        || t.chars()
-            .next()
-            .map(|c| c.is_ascii_digit())
-            .unwrap_or(false)
-            && (t.contains(". ") || t.contains(") "))
-}
-
-/// Returns true if a line consists entirely of a single repeated character
-/// (e.g., "----------", "**************", "============").
-fn is_decorative_separator(text: &str) -> bool {
-    let mut chars = text.chars();
-    let first = match chars.next() {
-        Some(c) => c,
-        None => return false,
-    };
-    chars.all(|c| c == first)
-}
-
-/// Strip lines that repeat on many distinct pages (running headers/footers).
-///
-/// A line is considered a repeated header/footer if:
-/// 1. Its normalized text appears on `>= max(3, page_count * 30%)` distinct pages
-/// 2. It is at least 10 characters long
-/// 3. It doesn't look like a structural element (heading, list item)
-/// 4. It consistently appears in the top or bottom N distinct Y positions
-/// 5. Its Y positions across pages have low variance (consistent placement),
-///    distinguishing true headers/footers from table content that happens to
-///    land near page margins
-/// 6. It is not a decorative separator (repeated single character)
-///
-/// Additionally, TextLines at the same Y position on a page are grouped into
-/// "Y-bands." When any member of a Y-band is stripped, all siblings in that
-/// band are also stripped. This handles split column headers where individual
-/// fragments may not independently meet the frequency threshold.
-///
-/// Page numbers are stripped from line text before comparison, so headers like
-/// "Chapter 3 — Page 5" and "Chapter 3 — Page 6" are treated as the same text.
-pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> {
-    if lines.is_empty() || page_count < 3 {
-        return lines;
-    }
-
-    // Compute Y range per page (min_y, max_y)
-    let mut page_y_range: HashMap<u32, (f32, f32)> = HashMap::new();
-    for line in &lines {
-        let entry = page_y_range.entry(line.page).or_insert((line.y, line.y));
-        if line.y < entry.0 {
-            entry.0 = line.y;
-        }
-        if line.y > entry.1 {
-            entry.1 = line.y;
-        }
-    }
-
-    // Build sorted Y values per page, so we can check line rank (position from edge)
-    let mut page_sorted_ys: HashMap<u32, Vec<f32>> = HashMap::new();
-    for line in &lines {
-        page_sorted_ys.entry(line.page).or_default().push(line.y);
-    }
-    for ys in page_sorted_ys.values_mut() {
-        ys.sort_by(|a, b| a.total_cmp(b));
-        ys.dedup();
-    }
-
-    // A line is in the page margin if it's among the first or last N distinct
-    // Y positions on that page. This is more robust than a percentage-based zone
-    // because it catches actual edge lines regardless of how much content fills
-    // the page. N=5 accommodates multi-line headers/footers and repeated form
-    // column headers (e.g., 5-row IRS form headers) that sit just inside the
-    // page margin.
-    const EDGE_LINE_COUNT: usize = 5;
-
-    /// Returns true if the given Y position is among the first or last N distinct
-    /// Y positions on the specified page.
-    fn is_y_at_edge(y: f32, page: u32, page_sorted_ys: &HashMap<u32, Vec<f32>>, n: usize) -> bool {
-        let ys = match page_sorted_ys.get(&page) {
-            Some(ys) => ys,
-            None => return false,
-        };
-        if ys.len() <= n * 2 {
-            // Page has very few lines — everything is near the edge
-            return true;
-        }
-        // Check if this Y is among the first or last N
-        let pos = match ys.iter().position(|&py| (py - y).abs() < 0.1) {
-            Some(p) => p,
-            None => return false,
-        };
-        pos < n || pos >= ys.len() - n
-    }
-
-    // Average page span for normalizing Y variance
-    let avg_span = {
-        let total: f32 = page_y_range.values().map(|(lo, hi)| hi - lo).sum();
-        if page_y_range.is_empty() {
-            1.0
-        } else {
-            (total / page_y_range.len() as f32).max(1.0)
-        }
-    };
-
-    // Build Y-bands: group line indices by (page, quantized_y).
-    // Lines at the same Y position (within ~0.1pt) on the same page form a band.
-    let mut y_bands: HashMap<(u32, i32), Vec<usize>> = HashMap::new();
-    for (idx, line) in lines.iter().enumerate() {
-        let y_bucket = (line.y * 10.0).round() as i32;
-        y_bands.entry((line.page, y_bucket)).or_default().push(idx);
-    }
-
-    // Build frequency maps using normalize_for_comparison.
-    // Individual line text -> distinct pages
-    let mut freq: HashMap<String, HashSet<u32>> = HashMap::new();
-    let mut y_positions: HashMap<String, Vec<f32>> = HashMap::new();
-    for line in &lines {
-        if !is_y_at_edge(line.y, line.page, &page_sorted_ys, EDGE_LINE_COUNT) {
-            continue;
-        }
-        let text = line.text();
-        let normalized = normalize_for_comparison(&text);
-        if normalized.len() < 10 || is_decorative_separator(&normalized) {
-            continue;
-        }
-        freq.entry(normalized.clone())
-            .or_default()
-            .insert(line.page);
-        y_positions.entry(normalized).or_default().push(line.y);
-    }
-
-    // Coalesced row text -> distinct pages (for multi-member Y-bands).
-    // This catches split column headers where individual fragments don't meet
-    // the frequency threshold but the combined row does.
-    let mut band_freq: HashMap<String, HashSet<u32>> = HashMap::new();
-    let mut band_y_positions: HashMap<String, Vec<f32>> = HashMap::new();
-    for (&(page, _), indices) in &y_bands {
-        if indices.len() < 2 {
-            continue; // single-line bands are already in the individual map
-        }
-        let band_y = lines[indices[0]].y;
-        if !is_y_at_edge(band_y, page, &page_sorted_ys, EDGE_LINE_COUNT) {
-            continue;
-        }
-        let mut sorted_indices = indices.clone();
-        sorted_indices.sort();
-        let coalesced: String = sorted_indices
-            .iter()
-            .map(|&i| lines[i].text())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let normalized = normalize_for_comparison(&coalesced);
-        if normalized.len() < 10 || is_decorative_separator(&normalized) {
-            continue;
-        }
-        band_freq
-            .entry(normalized.clone())
-            .or_default()
-            .insert(page);
-        band_y_positions.entry(normalized).or_default().push(band_y);
-    }
-
-    // Compute threshold
-    let threshold = 3u32.max(page_count * 30 / 100);
-
-    // Check Y-position consistency: headers/footers appear at the same position
-    // on every page, table content varies. Require normalized stddev < 5% of
-    // average page span.
-    let has_consistent_y = |text: &str, positions: &HashMap<String, Vec<f32>>| -> bool {
-        let pos = match positions.get(text) {
-            Some(p) if p.len() >= 2 => p,
-            _ => return true, // single occurrence — allow
-        };
-        let n = pos.len() as f32;
-        let mean = pos.iter().sum::<f32>() / n;
-        let variance = pos.iter().map(|y| (y - mean).powi(2)).sum::<f32>() / n;
-        let stddev = variance.sqrt();
-        stddev / avg_span < 0.05
-    };
-
-    // Identify candidates from individual frequency map
-    let candidates: HashSet<String> = freq
-        .into_iter()
-        .filter(|(text, pages)| {
-            pages.len() as u32 >= threshold
-                && !is_structural_line(text)
-                && has_consistent_y(text, &y_positions)
-        })
-        .map(|(text, _)| text)
-        .collect();
-
-    // Identify candidates from coalesced band frequency map
-    let band_candidates: HashSet<String> = band_freq
-        .into_iter()
-        .filter(|(text, pages)| {
-            pages.len() as u32 >= threshold
-                && !is_structural_line(text)
-                && has_consistent_y(text, &band_y_positions)
-        })
-        .map(|(text, _)| text)
-        .collect();
-
-    if candidates.is_empty() && band_candidates.is_empty() {
-        return lines;
-    }
-
-    // Build removal set.
-    // A line is removed if it's at an edge position and:
-    //   (a) its individual text matches a candidate, OR
-    //   (b) its Y-band's coalesced text matches a band candidate, OR
-    //   (c) any sibling in its Y-band was removed (propagation).
-    //
-    // The first occurrence (lowest page number) of each repeated header/footer
-    // is kept so that document titles, column headers, etc. appear once.
-    let mut removal_set: HashSet<usize> = HashSet::new();
-
-    // Track which page first shows each candidate (to preserve first occurrence)
-    let mut first_page_individual: HashMap<String, u32> = HashMap::new();
-    for (idx, line) in lines.iter().enumerate() {
-        if !is_y_at_edge(line.y, line.page, &page_sorted_ys, EDGE_LINE_COUNT) {
-            continue;
-        }
-        let text = line.text();
-        let normalized = normalize_for_comparison(&text);
-        if candidates.contains(&normalized) {
-            let first = first_page_individual.entry(normalized).or_insert(line.page);
-            if line.page > *first {
-                removal_set.insert(idx);
-            } else if line.page == *first {
-                // Keep this occurrence (first page)
-            }
-        }
-    }
-
-    // Track first page for band candidates
-    let mut first_page_band: HashMap<String, u32> = HashMap::new();
-    // First pass: find first page for each band candidate
-    for (&(page, _), indices) in &y_bands {
-        if indices.len() < 2 {
-            continue;
-        }
-        let band_y = lines[indices[0]].y;
-        if !is_y_at_edge(band_y, page, &page_sorted_ys, EDGE_LINE_COUNT) {
-            continue;
-        }
-        let mut sorted_indices = indices.clone();
-        sorted_indices.sort();
-        let coalesced: String = sorted_indices
-            .iter()
-            .map(|&i| lines[i].text())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let normalized = normalize_for_comparison(&coalesced);
-        if band_candidates.contains(&normalized) {
-            let first = first_page_band.entry(normalized).or_insert(page);
-            if page < *first {
-                *first = page;
-            }
-        }
-    }
-    // Second pass: mark for removal (skip first page)
-    for (&(page, _), indices) in &y_bands {
-        if indices.len() < 2 {
-            continue;
-        }
-        let band_y = lines[indices[0]].y;
-        if !is_y_at_edge(band_y, page, &page_sorted_ys, EDGE_LINE_COUNT) {
-            continue;
-        }
-        let mut sorted_indices = indices.clone();
-        sorted_indices.sort();
-        let coalesced: String = sorted_indices
-            .iter()
-            .map(|&i| lines[i].text())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let normalized = normalize_for_comparison(&coalesced);
-        if band_candidates.contains(&normalized) {
-            let first = first_page_band.get(&normalized).copied().unwrap_or(0);
-            if page > first {
-                for &idx in &sorted_indices {
-                    removal_set.insert(idx);
-                }
-            }
-        }
-    }
-
-    // (c) Y-band sibling propagation: if any member is removed, remove all
-    //     members (provided the band is at an edge position).
-    for (&(page, _), indices) in &y_bands {
-        let band_y = lines[indices[0]].y;
-        if !is_y_at_edge(band_y, page, &page_sorted_ys, EDGE_LINE_COUNT) {
-            continue;
-        }
-        if indices.iter().any(|idx| removal_set.contains(idx)) {
-            for &idx in indices {
-                removal_set.insert(idx);
-            }
-        }
-    }
-
-    if removal_set.is_empty() {
-        return lines;
-    }
-
-    lines
-        .into_iter()
-        .enumerate()
-        .filter(|(idx, _)| !removal_set.contains(idx))
-        .map(|(_, line)| line)
-        .collect()
 }
 
 #[cfg(test)]
@@ -538,12 +244,25 @@ mod tests {
             width: 100.0,
             height: font_size,
             font: "TestFont".to_string(),
+            font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size,
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
+            is_underline: false,
+            is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid,
+            baseline_shift: 0.0,
         }
     }
 
@@ -553,6 +272,24 @@ mod tests {
             y,
             page,
             adaptive_threshold: 0.10,
+        }
+    }
+
+    #[test]
+    fn drop_cap_merge_preserves_evidence_from_either_source() {
+        for (body_marked, cap_marked) in [(false, false), (true, false), (false, true)] {
+            let mut body = make_line("elcome", 12.0, 1, 700.0, None);
+            body.items[0].legacy_symbol_rewrite = body_marked;
+            let mut cap = make_line("W", 36.0, 1, 680.0, None);
+            cap.items[0].legacy_symbol_rewrite = cap_marked;
+
+            let result = merge_drop_caps(vec![body, cap], 12.0);
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].text(), "Welcome");
+            assert_eq!(
+                result[0].items[0].legacy_symbol_rewrite,
+                body_marked || cap_marked
+            );
         }
     }
 
@@ -637,50 +374,67 @@ mod tests {
         assert_eq!(result.len(), 2, "should merge font-based heading lines");
     }
 
-    #[test]
-    fn test_strip_repeated_keeps_first_occurrence() {
-        // Simulate a repeated page header on 10 pages.
-        // Each page has a running header at y=750 and many unique body lines.
-        let mut lines = Vec::new();
-        for page in 1..=10u32 {
-            // Header at top
-            lines.push(make_line(
-                "VOICE OF SOUTH MARION May fifteen twenty twenty five",
-                10.0,
-                page,
-                750.0,
-                None,
-            ));
-            // Body content — unique text per line per page (no digits to strip)
-            for j in 0..20u32 {
-                lines.push(make_line(
-                    &format!(
-                        "parcel r-{:04}-{:03} owner smith address oak street",
-                        page * 100 + j,
-                        page
-                    ),
-                    10.0,
-                    page,
-                    600.0 - j as f32 * 15.0,
-                    None,
-                ));
-            }
+    fn make_bold_line(text: &str, page: u32, y: f32) -> TextLine {
+        let mut item = make_item(text, 12.0, None);
+        item.is_bold = true;
+        TextLine {
+            items: vec![item],
+            y,
+            page,
+            adaptive_threshold: 0.10,
         }
+    }
 
-        let result = strip_repeated_lines(lines, 10);
+    #[test]
+    fn merge_wrapped_bold_heading_lowercase_continuation() {
+        // Bold-at-body-size heading wrapped across two lines: the second line
+        // starts lowercase and must merge into the first.
+        let lines = vec![
+            make_bold_line(
+                "3. Perspective of supply and demand balance and cost",
+                1,
+                700.0,
+            ),
+            make_bold_line("structure in Japan", 1, 686.0),
+            make_line("Body text paragraph follows here.", 12.0, 1, 660.0, None),
+        ];
+        let result = merge_heading_lines(lines, 12.0, &[], None);
+        assert_eq!(result.len(), 2, "wrapped bold heading should merge");
+        assert!(result[0].text().contains("cost structure in Japan"));
+    }
 
-        // The header should appear exactly once (page 1)
-        let header_count = result
-            .iter()
-            .filter(|l| l.text().contains("VOICE OF SOUTH MARION"))
-            .count();
-        assert_eq!(header_count, 1, "repeated header should be kept once");
+    #[test]
+    fn no_merge_for_bold_sentences_or_new_headings() {
+        // Second bold line starts with a capital — a new heading or label,
+        // not a wrap continuation.
+        let lines = vec![
+            make_bold_line("Replace", 1, 700.0),
+            make_bold_line("Trash", 1, 686.0),
+        ];
+        let result = merge_heading_lines(lines, 12.0, &[], None);
+        assert_eq!(result.len(), 2, "distinct bold lines must not merge");
 
-        // First occurrence should be on page 1
-        let first_header = result
-            .iter()
-            .find(|l| l.text().contains("VOICE OF SOUTH MARION"))
-            .unwrap();
-        assert_eq!(first_header.page, 1, "first occurrence should be on page 1");
+        // Previous line ends a sentence — continuation must not merge.
+        let lines = vec![
+            make_bold_line("This is a bold sentence.", 1, 700.0),
+            make_bold_line("another bold line", 1, 686.0),
+        ];
+        let result = merge_heading_lines(lines, 12.0, &[], None);
+        assert_eq!(result.len(), 2, "sentence-final bold line must not merge");
+    }
+
+    #[test]
+    fn tiered_bold_heading_does_not_absorb_bold_body() {
+        // Previous line is a tier-level bold heading (16pt vs 12pt body);
+        // a following lowercase bold body line must NOT merge into it.
+        let mut heading = make_bold_line("Section Title", 1, 700.0);
+        heading.items[0].font_size = 16.0;
+        heading.items[0].height = 16.0;
+        let lines = vec![
+            heading,
+            make_bold_line("emphasized body text continues here", 1, 686.0),
+        ];
+        let result = merge_heading_lines(lines, 12.0, &[16.0], None);
+        assert_eq!(result.len(), 2, "tiered heading must not absorb bold body");
     }
 }

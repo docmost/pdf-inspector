@@ -59,6 +59,21 @@ pub fn table_to_markdown(table: &Table) -> String {
     output
 }
 
+/// True when a detected data table survives formatting cleanup with a header,
+/// at least one body row, and at least two columns.
+///
+/// Supplemental OCR uses this at the structured-table boundary so incomplete
+/// detections cannot modify an otherwise clean native page.
+#[cfg(any(test, feature = "ocr"))]
+pub(crate) fn is_complete_data_table(table: &Table) -> bool {
+    if table.kind != TableKind::Data {
+        return false;
+    }
+
+    let (cleaned_cells, _) = clean_table_cells(&table.cells);
+    cleaned_cells.len() >= 2 && cleaned_cells.first().is_some_and(|row| row.len() >= 2)
+}
+
 /// Render a table-of-contents as a flat per-row text block.
 ///
 /// Each row becomes one line: non-empty cells joined with spaces, and the
@@ -75,7 +90,19 @@ fn format_toc_as_list(cells: &[Vec<String>], footnotes: &[String]) -> String {
             continue;
         };
 
+        // Leader dots glued to the page number ("..19") still read as a
+        // page cell; the dots are the leader, not the value.
         let last_cell = trimmed[last_idx];
+        let last_cell = if last_cell.starts_with('.') || last_cell.starts_with('\u{2026}') {
+            let stripped = last_cell.trim_start_matches(['.', '\u{2026}', ' ']);
+            if !stripped.is_empty() && is_page_number_cell(stripped) {
+                stripped
+            } else {
+                last_cell
+            }
+        } else {
+            last_cell
+        };
         let last_is_page = is_page_number_cell(last_cell);
 
         let (title_cells, trailing) = if last_is_page && last_idx > 0 {
@@ -123,9 +150,20 @@ fn format_toc_as_list(cells: &[Vec<String>], footnotes: &[String]) -> String {
 
 /// True when the cell looks like a page number.  Accepts:
 ///   - plain digit tokens: "42", "86 86"
+///   - canonical roman numerals (front-matter pages): "vii", "ix", "xii"
 ///   - dashed section-page IDs: "5-21", "A-1", "B--3", "TC-2" (common in
 ///     technical manuals)
 fn is_page_number_cell(cell: &str) -> bool {
+    // A label whose base has letters and carries a letter subscript or
+    // superscript (`V<sub>f</sub>`, `x<sub>i</sub>`) is never a page number,
+    // whatever its letters spell as roman numerals. On a digit-only base
+    // every span is a footnote marker (`12<sup>a</sup>`, `12<sup>1)</sup>`)
+    // and is dropped before the page-number test.
+    let base = super::cell_text::strip_script_spans(cell);
+    if base.chars().any(char::is_alphabetic) && super::cell_text::has_letter_script_span(cell) {
+        return false;
+    }
+    let cell = base;
     let tokens: Vec<&str> = cell.split_whitespace().collect();
     if tokens.is_empty() {
         return false;
@@ -137,6 +175,9 @@ fn is_page_number_cell(cell: &str) -> bool {
         let all_digits = t.chars().all(|c| c.is_ascii_digit());
         if all_digits {
             return t.len() <= 4;
+        }
+        if super::canonical_roman_value(t).is_some() {
+            return true;
         }
         // Section-page form: uppercase letters, digits, dashes; at least
         // one digit present.
@@ -158,6 +199,96 @@ fn starts_with_uppercase_word(cell: &str) -> bool {
     cell.chars()
         .find(|c| c.is_alphanumeric())
         .is_some_and(|c| c.is_uppercase())
+}
+
+fn starts_with_uppercase_alpha(cell: &str) -> bool {
+    cell.chars()
+        .find(|c| c.is_alphabetic())
+        .is_some_and(|c| c.is_uppercase())
+}
+
+fn starts_with_lowercase_alpha(cell: &str) -> bool {
+    cell.chars()
+        .find(|c| c.is_alphabetic())
+        .is_some_and(|c| c.is_lowercase())
+}
+
+fn starts_with_numbered_label(cell: &str) -> bool {
+    let trimmed = cell.trim_start();
+    let digit_count = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
+
+    digit_count > 0
+        && digit_count <= 3
+        && trimmed
+            .chars()
+            .nth(digit_count)
+            .is_some_and(|c| matches!(c, '.' | ')' | '-' | ':'))
+}
+
+fn starts_with_hierarchical_numbered_label(cell: &str) -> bool {
+    let token = cell
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(['.', ')', ':', '-']);
+    let levels: Vec<&str> = token.split('.').collect();
+    (2..=4).contains(&levels.len())
+        && levels.iter().all(|level| {
+            !level.is_empty()
+                && level.len() <= 3
+                && level.chars().all(|character| character.is_ascii_digit())
+        })
+}
+
+fn alpha_word_count(cell: &str) -> usize {
+    cell.split_whitespace()
+        .filter(|word| word.chars().any(|c| c.is_alphabetic()))
+        .count()
+}
+
+fn looks_like_compact_entry_label(cell: &str) -> bool {
+    let trimmed = cell.trim();
+    if trimmed.len() < 3 || trimmed.len() > 80 {
+        return false;
+    }
+
+    if !starts_with_uppercase_alpha(trimmed) && !starts_with_numbered_label(trimmed) {
+        return false;
+    }
+
+    if trimmed.ends_with(['.', ',', ';', ':']) {
+        return false;
+    }
+
+    let words = alpha_word_count(trimmed);
+    (1..=6).contains(&words)
+}
+
+fn looks_like_plain_section_label(cell: &str) -> bool {
+    let trimmed = cell.trim();
+    if trimmed.len() < 4 || trimmed.len() > 40 {
+        return false;
+    }
+    if trimmed.ends_with(['.', ',', ';', ':']) || trimmed.contains(|ch: char| ch.is_ascii_digit()) {
+        return false;
+    }
+    if trimmed.len() <= 4 && trimmed.chars().all(|ch| !ch.is_lowercase()) {
+        return false;
+    }
+    trimmed
+        .chars()
+        .all(|ch| ch.is_alphabetic() || ch.is_whitespace() || matches!(ch, '&' | '/' | '-'))
+        && starts_with_uppercase_alpha(trimmed)
+        && (1..=4).contains(&alpha_word_count(trimmed))
+}
+
+fn ends_like_incomplete_phrase(cell: &str) -> bool {
+    let lower = cell.trim_end().to_ascii_lowercase();
+    lower.ends_with(" and")
+        || lower.ends_with(" or")
+        || lower.ends_with(',')
+        || lower.ends_with('-')
+        || lower.ends_with('/')
 }
 
 /// Clean up table cells: merge continuation rows, extract footnotes, remove empty rows
@@ -185,6 +316,9 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
             continue;
         }
 
+        let num_cols = row.len();
+        let filled_cells = row.iter().filter(|c| !c.trim().is_empty()).count();
+
         // Check if this is a continuation row (first column is empty but others have content).
         // A row with only 1 short non-empty cell (besides the first) is more likely a
         // section sub-header (e.g. "JAN", "FEB") than overflow text — don't merge it.
@@ -196,57 +330,113 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
             .map(|c| c.trim())
             .filter(|c| !c.is_empty())
             .collect();
-        let is_short_subheader = non_first_cells.len() == 1 && non_first_cells[0].len() <= 5;
+        // Lengths are measured without `<sup>`/`<sub>` tags (content kept):
+        // `IV<sub>subc</sub>` is the six-character token it looks like.
+        let plain_cells: Vec<std::borrow::Cow<'_, str>> = non_first_cells
+            .iter()
+            .map(|c| super::cell_text::strip_script_markup(c))
+            .collect();
+        let is_short_subheader = plain_cells.len() == 1 && plain_cells[0].len() <= 5;
         // Rows with multiple short-valued cells (e.g. numeric data in a lookup
         // table) are data rows with a merged/spanning first column, not text
         // overflow from the previous row.  Continuation rows typically have
         // longer descriptive text; data rows have short numeric values.
-        let avg_cell_len = if non_first_cells.is_empty() {
+        let avg_cell_len = if plain_cells.is_empty() {
             0.0
         } else {
-            non_first_cells.iter().map(|c| c.len()).sum::<usize>() as f32
-                / non_first_cells.len() as f32
+            plain_cells.iter().map(|c| c.len()).sum::<usize>() as f32 / plain_cells.len() as f32
         };
+        // Numeric-ness is judged on the value alone — a footnote marker is an
+        // annotation, so `12<sup>1)</sup>` is the number 12 and a cell that
+        // holds only a marker is a numeric row's annotation column.
         let numeric_cells = non_first_cells
             .iter()
             .filter(|c| {
-                c.chars().all(|ch| {
-                    ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == ',' || ch == ' '
-                })
+                let value = super::cell_text::strip_marker_spans(c);
+                value.trim().is_empty()
+                    || value.chars().all(|ch| {
+                        ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == ',' || ch == ' '
+                    })
             })
             .count();
         let looks_like_data_row = non_first_cells.len() >= 2
             && avg_cell_len <= 10.0
             && numeric_cells > non_first_cells.len() / 2;
-        let uppercase_leading_cells = non_first_cells
+        let uppercase_leading_cells = plain_cells
             .iter()
             .filter(|cell| starts_with_uppercase_word(cell))
             .count();
+        let first_non_empty_col = row.iter().position(|c| !c.trim().is_empty());
+        let first_non_empty_cell = first_non_empty_col
+            .and_then(|idx| row.get(idx))
+            .map(|c| c.trim())
+            .unwrap_or("");
+        let title_like_later_cells = first_non_empty_col
+            .map(|idx| {
+                row.iter()
+                    .skip(idx + 1)
+                    .map(|c| c.trim())
+                    .filter(|c| !c.is_empty() && starts_with_uppercase_alpha(c))
+                    .count()
+            })
+            .unwrap_or(0);
+        let prev_first_cell_empty = cleaned
+            .last()
+            .and_then(|r| r.first())
+            .is_some_and(|c| c.trim().is_empty());
+        let prev_first_cell = cleaned
+            .last()
+            .and_then(|r| r.first())
+            .map(|c| c.trim())
+            .unwrap_or("");
+        let header_filled = cleaned
+            .first()
+            .map(|r| r.iter().filter(|c| !c.trim().is_empty()).count())
+            .unwrap_or(num_cols);
         let looks_like_spanning_first_column_row = first_cell.is_empty()
             && row.len() >= 4
             && non_first_cells.len() == row.len().saturating_sub(1)
             && uppercase_leading_cells >= non_first_cells.len().saturating_sub(1);
+        // Hierarchical tables often use a row-spanned first column: sub-rows
+        // leave column 0 blank, then start a compact title-like label in
+        // column 1.  Wrapped continuations in the existing fixtures start
+        // mid-sentence/lowercase ("continued text here", "with 3.5%...") or
+        // carry lowercase fragments in the later cells, so keep those mergeable.
+        let looks_like_hierarchical_subrow = first_cell.is_empty()
+            && first_non_empty_col == Some(1)
+            && looks_like_compact_entry_label(first_non_empty_cell)
+            && ((row.len() == 2 && starts_with_hierarchical_numbered_label(first_non_empty_cell))
+                || (row.len() >= 3 && non_first_cells.len() >= 2 && title_like_later_cells > 0)
+                || (non_first_cells.len() == 1
+                    && row.len() >= 3
+                    && prev_first_cell_empty
+                    && alpha_word_count(first_non_empty_cell) >= 2));
+        let looks_like_new_first_column_entry = !first_cell.is_empty()
+            && (starts_with_numbered_label(first_cell) || starts_with_uppercase_alpha(first_cell))
+            && filled_cells >= 2
+            && non_first_cells
+                .iter()
+                .any(|cell| looks_like_compact_entry_label(cell));
+        let looks_like_section_label_row = !first_cell.is_empty()
+            && filled_cells == 1
+            && header_filled >= 3
+            && looks_like_plain_section_label(first_cell);
         // Classic continuation: first cell empty, content in other cells
         let is_classic_continuation = first_cell.is_empty()
             && !non_first_cells.is_empty()
             && !is_short_subheader
             && !looks_like_data_row
             && !looks_like_spanning_first_column_row
+            && !looks_like_hierarchical_subrow
             && cleaned.len() > 1;
 
         // Wrapped-cell continuation: row has fewer filled cells than the header
         // row, suggesting it's overflow text from the previous row's cells.
         // Only trigger when the previous row has significantly more filled cells.
-        let num_cols = row.len();
-        let filled_cells = row.iter().filter(|c| !c.trim().is_empty()).count();
         let prev_filled = cleaned
             .last()
             .map(|r| r.iter().filter(|c| !c.trim().is_empty()).count())
             .unwrap_or(0);
-        let header_filled = cleaned
-            .first()
-            .map(|r| r.iter().filter(|c| !c.trim().is_empty()).count())
-            .unwrap_or(num_cols);
         // Merge when the row has significantly fewer filled cells than header.
         // For wide tables (5+ cols), require ≤50% of header cells.
         // For narrow tables (2-4 cols), require fewer than header cells.
@@ -257,11 +447,18 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
         } else {
             header_filled.saturating_sub(1)
         };
+        let continues_wrapped_first_column_label = !first_cell.is_empty()
+            && starts_with_lowercase_alpha(first_cell)
+            && ends_like_incomplete_phrase(prev_first_cell);
         let is_wrapped_continuation = cleaned.len() > 1
             && filled_cells <= max_filled_for_merge
-            && prev_filled > filled_cells
+            && (prev_filled > filled_cells
+                || (continues_wrapped_first_column_label && prev_filled >= filled_cells))
             && !looks_like_data_row
             && !looks_like_spanning_first_column_row
+            && !looks_like_hierarchical_subrow
+            && !looks_like_new_first_column_entry
+            && !looks_like_section_label_row
             && !is_short_subheader;
 
         let is_continuation = is_classic_continuation || is_wrapped_continuation;
@@ -291,6 +488,16 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
 /// Check if a cell value indicates a footnote row
 fn is_footnote_row(text: &str) -> bool {
     let trimmed = text.trim();
+
+    // Japanese documents commonly use the reference mark followed by an
+    // ASCII or full-width number (for example `※1` / `※１`). These rows often
+    // sit immediately below a wide table and must not be merged into its last
+    // data row as wrapped first-column content.
+    if let Some(rest) = trimmed.strip_prefix('※') {
+        return rest.chars().next().is_some_and(|character| {
+            character.is_ascii_digit() || ('０'..='９').contains(&character)
+        });
+    }
 
     // Check for common footnote patterns
     // (1), (2), etc.
@@ -354,6 +561,13 @@ mod tests {
     }
 
     #[test]
+    fn test_is_footnote_row_reference_mark_number() {
+        assert!(is_footnote_row("※1 explanation"));
+        assert!(is_footnote_row("※１ 説明"));
+        assert!(!is_footnote_row("※ general marker"));
+    }
+
+    #[test]
     fn test_is_footnote_row_plain_text_false() {
         assert!(!is_footnote_row("Regular cell text"));
         assert!(!is_footnote_row("Amount"));
@@ -408,6 +622,44 @@ mod tests {
     }
 
     #[test]
+    fn test_clean_table_cells_first_column_section_label_not_merged() {
+        let cells = vec![
+            vec![
+                "Properties".into(),
+                "Conditions".into(),
+                "Method".into(),
+                "Typical values".into(),
+                "Units".into(),
+            ],
+            vec![
+                "Melt Flow Rate".into(),
+                "230 C/2.16 kg".into(),
+                "ASTM D1238".into(),
+                "3.0".into(),
+                "g/10 min".into(),
+            ],
+            vec![
+                "Mechanical".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+            ],
+            vec![
+                "Tensile Stress at Yield".into(),
+                "50 mm/min".into(),
+                "ASTM D638".into(),
+                "31".into(),
+                "MPa".into(),
+            ],
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+
+        assert_eq!(cleaned.len(), 4);
+        assert_eq!(cleaned[2][0], "Mechanical");
+    }
+
+    #[test]
     fn test_clean_table_cells_short_subheader_not_merged() {
         let cells = vec![
             vec!["Header".into(), "Col2".into()],
@@ -457,6 +709,140 @@ mod tests {
         assert_eq!(cleaned.len(), 3);
         assert_eq!(cleaned[2][0], "");
         assert_eq!(cleaned[2][1], "Uncertainty around other copies");
+    }
+
+    #[test]
+    fn test_clean_table_cells_numbered_hierarchy_rows_not_overmerged() {
+        let cells = vec![
+            vec![
+                "Group".into(),
+                "Task".into(),
+                "Detail".into(),
+                "Benefit".into(),
+            ],
+            vec![
+                "1. Group alpha".into(),
+                "Task setup and".into(),
+                "Begin setup".into(),
+                "Faster start".into(),
+            ],
+            vec![
+                "".into(),
+                "management".into(),
+                "recommended profile".into(),
+                "with saved defaults".into(),
+            ],
+            vec![
+                "2. Group beta and".into(),
+                "Storage setup".into(),
+                "Provides upload tools".into(),
+                "".into(),
+            ],
+            vec![
+                "fine-tuning".into(),
+                "".into(),
+                "for filtered inputs".into(),
+                "service".into(),
+            ],
+            vec![
+                "".into(),
+                "Label workspace".into(),
+                "Creates review sets".into(),
+                "Lets teams review".into(),
+            ],
+            vec![
+                "".into(),
+                "Model training".into(),
+                "".into(),
+                "Supports custom model".into(),
+            ],
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+
+        assert_eq!(cleaned.len(), 5);
+        assert_eq!(cleaned[1][0], "1. Group alpha");
+        assert_eq!(cleaned[1][1], "Task setup and management");
+        assert_eq!(cleaned[2][0], "2. Group beta and fine-tuning");
+        assert_eq!(cleaned[2][1], "Storage setup");
+        assert_eq!(cleaned[3][1], "Label workspace");
+        assert_eq!(cleaned[4][1], "Model training");
+    }
+
+    #[test]
+    fn test_clean_table_cells_two_column_numbered_subrows_not_merged() {
+        let cells = vec![
+            vec!["Area".into(), "Competence".into()],
+            vec![
+                "1. Embodying sustainability values".into(),
+                "1.1 Valuing sustainability".into(),
+            ],
+            vec!["".into(), "1.2 Supporting fairness".into()],
+            vec!["".into(), "1.3 Promoting nature".into()],
+            vec![
+                "2. Embracing complexity".into(),
+                "2.1 Systems thinking".into(),
+            ],
+            vec!["".into(), "2.2 Critical thinking".into()],
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+
+        assert_eq!(cleaned.len(), 6);
+        assert_eq!(cleaned[2], vec!["", "1.2 Supporting fairness"]);
+        assert_eq!(cleaned[3], vec!["", "1.3 Promoting nature"]);
+        assert_eq!(cleaned[5], vec!["", "2.2 Critical thinking"]);
+    }
+
+    #[test]
+    fn test_clean_table_cells_two_column_numbered_continuation_merges() {
+        let cells = vec![
+            vec!["Area".into(), "Requirement".into()],
+            vec!["Safety".into(), "The program includes".into()],
+            vec!["".into(), "1. First requirement for every operator".into()],
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+
+        assert_eq!(cleaned.len(), 2);
+        assert_eq!(
+            cleaned[1][1],
+            "The program includes 1. First requirement for every operator"
+        );
+    }
+
+    #[test]
+    fn test_clean_table_cells_partial_hierarchical_subrow_not_merged() {
+        let cells = vec![
+            vec![
+                "Group".into(),
+                "Task".into(),
+                "Detail".into(),
+                "Benefit".into(),
+            ],
+            vec![
+                "Group A".into(),
+                "Alpha task".into(),
+                "Initial detail".into(),
+                "Initial benefit".into(),
+            ],
+            vec![
+                "".into(),
+                "Beta task".into(),
+                "Parallel detail".into(),
+                "".into(),
+            ],
+            vec![
+                "".into(),
+                "second line".into(),
+                "additional detail".into(),
+                "".into(),
+            ],
+        ];
+        let (cleaned, _) = clean_table_cells(&cells);
+
+        assert_eq!(cleaned.len(), 3);
+        assert_eq!(cleaned[1][1], "Alpha task");
+        assert_eq!(cleaned[2][0], "");
+        assert_eq!(cleaned[2][1], "Beta task second line");
+        assert_eq!(cleaned[2][2], "Parallel detail additional detail");
     }
 
     #[test]
@@ -562,6 +948,29 @@ mod tests {
     }
 
     #[test]
+    fn complete_data_table_requires_header_body_and_two_columns() {
+        let complete = Table {
+            columns: vec![100.0, 200.0, 300.0],
+            rows: vec![500.0, 480.0, 460.0],
+            cells: vec![
+                vec!["Metric".into(), "Value".into()],
+                vec!["Accuracy".into(), "95%".into()],
+            ],
+            item_indices: vec![],
+            kind: TableKind::Data,
+        };
+        assert!(is_complete_data_table(&complete));
+
+        let mut single_row = complete.clone();
+        single_row.cells.truncate(1);
+        assert!(!is_complete_data_table(&single_row));
+
+        let mut toc = complete;
+        toc.kind = TableKind::Toc;
+        assert!(!is_complete_data_table(&toc));
+    }
+
+    #[test]
     fn test_table_to_markdown_empty_table() {
         let table = Table {
             columns: vec![],
@@ -656,5 +1065,15 @@ mod tests {
         );
         assert!(md.contains("4.3 Case studies and targeted evaluations\t86"));
         assert!(md.contains("4.5 White-box analyses\t113"));
+    }
+
+    #[test]
+    fn scripted_labels_are_not_page_numbers() {
+        assert!(!is_page_number_cell("V<sub>f</sub>"));
+        assert!(!is_page_number_cell("x<sub>i</sub>"));
+        assert!(is_page_number_cell("12<sup>1)</sup>"));
+        assert!(is_page_number_cell("12<sup>a</sup>"));
+        assert!(is_page_number_cell("xi<sup>1)</sup>"));
+        assert!(is_page_number_cell("xi"));
     }
 }

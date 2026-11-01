@@ -1,5 +1,6 @@
 //! Core line-to-markdown conversion loop with table/image interleaving.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use crate::structure_tree::StructRole;
@@ -7,14 +8,153 @@ use crate::types::TextLine;
 
 use super::analysis::{
     bold_heading_level, calculate_font_stats, compute_heading_tiers, compute_paragraph_threshold,
-    detect_header_level, font_size_rarity, has_dot_leaders,
+    detect_header_level, font_size_rarity, has_dot_leaders, is_heading_fragment,
+    is_leader_continuation, is_toc_entry_line, is_toc_marker_heading, trailing_leader_dots,
 };
-use super::classify::{
-    format_list_item, is_caption_line, is_list_item, is_monospace_font, starts_with_bullet_marker,
-};
+use super::classify::{format_list_item, is_caption_line, is_list_item, starts_with_bullet_marker};
+use super::heading::classify_heading_sequences;
 use super::postprocess::clean_markdown;
 use super::preprocess::{merge_drop_caps, merge_heading_lines};
-use super::MarkdownOptions;
+use super::{item_is_in_chart_region, MarkdownOptions, CHART_SEPARATOR_PAD};
+
+/// Logical stream geometry for a page where one full-width chart separates
+/// two prose columns. Positioned non-text blocks use this same ordering so a
+/// right-column table or image cannot jump ahead of left-column prose.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ChartProseOrder {
+    split_x: f32,
+    chart_region: (f32, f32, f32, f32),
+}
+
+impl ChartProseOrder {
+    pub(super) fn new(split_x: f32, chart_region: (f32, f32, f32, f32)) -> Self {
+        Self {
+            split_x,
+            chart_region,
+        }
+    }
+}
+
+/// Markdown block with its physical position and optional logical chart-page
+/// stream. Tables and images share this representation because both are
+/// removed before text-line grouping and reinserted during conversion.
+#[derive(Debug, Clone)]
+pub(super) struct PositionedMarkdown {
+    y: f32,
+    x: f32,
+    markdown: String,
+    chart_order: Option<ChartProseOrder>,
+}
+
+impl PositionedMarkdown {
+    pub(super) fn new(
+        y: f32,
+        x: f32,
+        markdown: String,
+        chart_order: Option<ChartProseOrder>,
+    ) -> Self {
+        Self {
+            y,
+            x,
+            markdown,
+            chart_order,
+        }
+    }
+}
+
+fn chart_stream_position(
+    y: f32,
+    x: f32,
+    claimed_by_chart: bool,
+    order: ChartProseOrder,
+) -> (u8, u8) {
+    let (_, y0, _, y1) = order.chart_region;
+    let low = y0.min(y1) - CHART_SEPARATOR_PAD;
+    let high = y0.max(y1) + CHART_SEPARATOR_PAD;
+    let in_chart_zone = claimed_by_chart || (y >= low && y <= high);
+    let zone = if in_chart_zone {
+        1
+    } else if y > high {
+        0
+    } else {
+        2
+    };
+    let column = if in_chart_zone || x < order.split_x {
+        0
+    } else {
+        1
+    };
+    (zone, column)
+}
+
+fn positioned_block_precedes_line(block: &PositionedMarkdown, line: &TextLine) -> bool {
+    let Some(order) = block.chart_order else {
+        return block.y > line.y;
+    };
+    let line_x = line.items.first().map(|item| item.x).unwrap_or(0.0);
+    let line_claimed_by_chart = line
+        .items
+        .iter()
+        .any(|item| item_is_in_chart_region(item, &[order.chart_region]));
+    let block_position = chart_stream_position(block.y, block.x, false, order);
+    let line_position = chart_stream_position(line.y, line_x, line_claimed_by_chart, order);
+    block_position < line_position || (block_position == line_position && block.y > line.y)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PositionedBlockKind {
+    Table,
+    Image,
+}
+
+type PositionedBlockRef<'a> = (PositionedBlockKind, usize, &'a PositionedMarkdown);
+
+fn compare_positioned_blocks(
+    (a_kind, a_idx, a): &PositionedBlockRef<'_>,
+    (b_kind, b_idx, b): &PositionedBlockRef<'_>,
+) -> Ordering {
+    if let (Some(a_order), Some(b_order)) = (a.chart_order, b.chart_order) {
+        let a_position = chart_stream_position(a.y, a.x, false, a_order);
+        let b_position = chart_stream_position(b.y, b.x, false, b_order);
+        return a_position
+            .cmp(&b_position)
+            .then_with(|| b.y.total_cmp(&a.y))
+            .then_with(|| a.x.total_cmp(&b.x))
+            .then_with(|| a_kind.cmp(b_kind))
+            .then_with(|| a_idx.cmp(b_idx));
+    }
+
+    // Preserve the legacy ordering for ordinary pages: tables in detection
+    // order, followed by images in input order. Chart pages give every block
+    // a chart order and use the logical stream comparison above.
+    a_kind.cmp(b_kind).then_with(|| a_idx.cmp(b_idx))
+}
+
+fn positioned_blocks_for_page<'a>(
+    page: u32,
+    page_tables: &'a HashMap<u32, Vec<PositionedMarkdown>>,
+    page_images: &'a HashMap<u32, Vec<PositionedMarkdown>>,
+) -> Vec<PositionedBlockRef<'a>> {
+    let mut blocks = Vec::new();
+    if let Some(tables) = page_tables.get(&page) {
+        blocks.extend(
+            tables
+                .iter()
+                .enumerate()
+                .map(|(idx, table)| (PositionedBlockKind::Table, idx, table)),
+        );
+    }
+    if let Some(images) = page_images.get(&page) {
+        blocks.extend(
+            images
+                .iter()
+                .enumerate()
+                .map(|(idx, image)| (PositionedBlockKind::Image, idx, image)),
+        );
+    }
+    blocks.sort_by(compare_positioned_blocks);
+    blocks
+}
 
 /// Pre-scan struct heading tags to find levels that are overused — i.e., tagged on
 /// so many lines that they clearly represent body text, not real headings.
@@ -140,13 +280,266 @@ fn find_isolated_lines(lines: &[TextLine], base_size: f32, para_threshold: f32) 
         }
     }
     for (&page, &(total, isolated)) in &page_line_counts {
-        if total > 0 && isolated as f32 / total as f32 > 0.25 {
-            // Too many isolated lines on this page — remove them all
+        // The ratio only means something on pages dense enough for a
+        // multi-column misfire; on sparse pages (covers, ToC pages with a
+        // lone title) one isolated line is 25%+ of the page and exactly the
+        // line isolation exists to find.
+        if total >= 10 && isolated as f32 / total as f32 > 0.25 {
             set.retain(|&i| lines[i].page != page);
         }
     }
 
     set
+}
+
+/// Pre-scan body-size all-bold runs that are too long to be headings.
+///
+/// Some academic PDFs use an all-bold abstract/summary paragraph immediately
+/// after the author block.  A line-local bold heading heuristic sees each
+/// wrapped visual line as "standalone" once the first line is misclassified,
+/// producing a stack of `##` headings.  Multi-line body-size bold runs with a
+/// paragraph-sized word count should stay paragraph text.
+/// Merge 2-3 consecutive all-bold body-size lines into one line when the
+/// group is isolated (paragraph break before and after) and short enough to
+/// be a heading. Longer/wordier bold runs are wrapped bold paragraphs and
+/// are left for `find_wrapped_bold_paragraph_lines` to suppress.
+/// "9.5. ", "12.3.1. " — section-numbered heading prefix followed by a word.
+fn starts_with_section_number(t: &str) -> bool {
+    let t = t.trim_start();
+    let mut rest = t;
+    let mut groups = 0;
+    loop {
+        let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digits == 0 || digits > 3 {
+            break;
+        }
+        groups += 1;
+        rest = &rest[digits..];
+        if let Some(r) = rest.strip_prefix('.') {
+            rest = r;
+        } else {
+            break;
+        }
+    }
+    // Two components minimum ("9.5. "): a single "1. " is an ordered list
+    // item, and this prefix bypasses the isolation checks entirely.
+    groups >= 2
+        && rest.starts_with(char::is_whitespace)
+        && rest.trim_start().starts_with(|c: char| c.is_alphabetic())
+}
+
+fn merge_wrapped_bold_heading_groups(
+    lines: Vec<TextLine>,
+    base_size: f32,
+    para_threshold: f32,
+) -> Vec<TextLine> {
+    let mut out: Vec<TextLine> = Vec::with_capacity(lines.len());
+    let mut i = 0usize;
+    while i < lines.len() {
+        if !is_body_size_all_bold_line(&lines[i], base_size) {
+            out.push(lines[i].clone());
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut end = i;
+        let mut word_count = lines[i].text().split_whitespace().count();
+        while end + 1 < lines.len()
+            && is_body_size_all_bold_line(&lines[end + 1], base_size)
+            && is_wrapped_same_style_line(&lines[end], &lines[end + 1], para_threshold)
+        {
+            end += 1;
+            word_count += lines[end].text().split_whitespace().count();
+        }
+        let line_count = end - start + 1;
+        // Column-local isolation: on interleaved multi-column pages the
+        // vector neighbors may be the other column's lines, so judge the
+        // break by x-overlapping lines only.
+        let gx0 = lines[start..=end]
+            .iter()
+            .flat_map(|l| l.items.iter().map(|i| i.x))
+            .fold(f32::INFINITY, f32::min);
+        let gx1 = lines[start..=end]
+            .iter()
+            .flat_map(|l| l.items.iter().map(|i| i.x + i.width))
+            .fold(f32::NEG_INFINITY, f32::max);
+        let overlaps_x = |l: &TextLine| {
+            let lx0 = l.items.iter().map(|i| i.x).fold(f32::INFINITY, f32::min);
+            let lx1 = l
+                .items
+                .iter()
+                .map(|i| i.x + i.width)
+                .fold(f32::NEG_INFINITY, f32::max);
+            lx0 < gx1 && lx1 > gx0
+        };
+        let page = lines[start].page;
+        let break_before = !lines.iter().any(|l| {
+            l.page == page
+                && l.y > lines[start].y
+                && l.y - lines[start].y <= para_threshold
+                && overlaps_x(l)
+        });
+        let break_after = !lines.iter().any(|l| {
+            l.page == page
+                && l.y < lines[end].y
+                && lines[end].y - l.y <= para_threshold
+                && overlaps_x(l)
+        });
+        let numbered = starts_with_section_number(&lines[start].text());
+        if (2..=3).contains(&line_count)
+            && word_count <= 15
+            && ((break_before && break_after) || numbered)
+        {
+            let mut merged = lines[start].clone();
+            for l in &lines[start + 1..=end] {
+                merged.items.extend(l.items.iter().cloned());
+            }
+            out.push(merged);
+        } else {
+            for l in &lines[start..=end] {
+                out.push(l.clone());
+            }
+        }
+        i = end + 1;
+    }
+    out
+}
+
+fn find_wrapped_bold_paragraph_lines(
+    lines: &[TextLine],
+    base_size: f32,
+    para_threshold: f32,
+) -> (HashSet<usize>, HashSet<usize>) {
+    let mut set = HashSet::new();
+    let mut quoted = HashSet::new();
+    let mut i = 0usize;
+
+    while i < lines.len() {
+        if !is_body_size_all_bold_line(&lines[i], base_size) {
+            i += 1;
+            continue;
+        }
+
+        let start = i;
+        let mut end = i;
+        let mut word_count = lines[i].text().split_whitespace().count();
+
+        while end + 1 < lines.len()
+            && is_body_size_all_bold_line(&lines[end + 1], base_size)
+            && is_wrapped_same_style_line(&lines[end], &lines[end + 1], para_threshold)
+        {
+            end += 1;
+            word_count += lines[end].text().split_whitespace().count();
+        }
+
+        let line_count = end - start + 1;
+        // A long enclosed quotation is prose even when it wraps to only two
+        // lines. Keep its indices separate so only this case also vetoes
+        // font-tier promotion; the existing unquoted paragraph policy stays.
+        let quoted_prose =
+            line_count >= 2 && word_count > 20 && has_enclosing_double_quotes(&lines[start..=end]);
+        if (line_count >= 3 && word_count > 20) || quoted_prose {
+            for idx in start..=end {
+                set.insert(idx);
+                if quoted_prose {
+                    quoted.insert(idx);
+                }
+            }
+        }
+
+        i = end + 1;
+    }
+
+    (set, quoted)
+}
+
+fn has_enclosing_double_quotes(lines: &[TextLine]) -> bool {
+    let text = lines
+        .iter()
+        .map(TextLine::text)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let text = text.trim();
+    [('“', '”'), ('"', '"')].iter().any(|&(open, close)| {
+        text.strip_prefix(open)
+            .and_then(|body| body.split_once(close))
+            // Two independently quoted titles are not one quoted paragraph.
+            .is_some_and(|(body, suffix)| !body.contains(open) && is_quote_suffix(suffix))
+    })
+}
+
+fn is_quote_suffix(mut suffix: &str) -> bool {
+    loop {
+        suffix = suffix.trim_start();
+        let Some(first) = suffix.chars().next() else {
+            return true;
+        };
+        match first {
+            // Accept punctuation and recognizable footnote markers, never
+            // arbitrary prose or another quotation after the closing quote.
+            '.' | ',' | ';' | ':' | '!' | '?' | '…' | '*' | '†' | '‡' | '⁰' | '¹' | '²' | '³'
+            | '⁴' | '⁵' | '⁶' | '⁷' | '⁸' | '⁹' => {
+                suffix = &suffix[first.len_utf8()..];
+            }
+            '[' | '(' => {
+                let close = if first == '[' { ']' } else { ')' };
+                let Some((reference, rest)) = suffix[1..].split_once(close) else {
+                    return false;
+                };
+                if !is_numeric_quote_reference(reference, first == '[') {
+                    return false;
+                }
+                suffix = rest;
+            }
+            _ => return false,
+        }
+    }
+}
+
+fn is_numeric_quote_reference(mut reference: &str, allow_list: bool) -> bool {
+    loop {
+        reference = reference.trim_start();
+        let digits = reference.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return false;
+        }
+        reference = reference[digits..].trim_start();
+        if reference.is_empty() {
+            return true;
+        }
+        let separator = reference.chars().next().unwrap();
+        if !allow_list || !matches!(separator, ',' | '-' | '–') {
+            return false;
+        }
+        reference = &reference[separator.len_utf8()..];
+    }
+}
+
+fn is_body_size_all_bold_line(line: &TextLine, base_size: f32) -> bool {
+    let Some(first) = line.items.first() else {
+        return false;
+    };
+    first.font_size >= base_size * 0.95
+        && first.font_size < base_size * 1.2
+        && line
+            .items
+            .iter()
+            .all(|item| item.is_bold && (item.font_size - first.font_size).abs() < 0.5)
+}
+
+fn is_wrapped_same_style_line(prev: &TextLine, next: &TextLine, para_threshold: f32) -> bool {
+    if prev.page != next.page {
+        return false;
+    }
+
+    let y_gap = prev.y - next.y;
+    if !(y_gap > 0.0 && y_gap <= para_threshold) {
+        return false;
+    }
+
+    let prev_x = prev.items.first().map(|item| item.x).unwrap_or(0.0);
+    let next_x = next.items.first().map(|item| item.x).unwrap_or(0.0);
+    (prev_x - next_x).abs() <= 40.0
 }
 
 /// Resolve the dominant structure role for a text line by looking up its items' MCIDs.
@@ -200,7 +593,7 @@ fn struct_role_heading_level(role: &StructRole) -> Option<usize> {
 /// We strip their header+separator rows and append their data rows to the first page's
 /// table, then remove them from later pages.
 pub(super) fn merge_continuation_tables(
-    page_tables: &mut std::collections::HashMap<u32, Vec<(f32, String)>>,
+    page_tables: &mut std::collections::HashMap<u32, Vec<PositionedMarkdown>>,
     table_only_pages: &HashSet<u32>,
 ) {
     let mut sorted_pages: Vec<u32> = page_tables.keys().copied().collect();
@@ -228,7 +621,7 @@ pub(super) fn merge_continuation_tables(
             continue;
         }
 
-        let first_col_count = count_table_columns(&first_tables[0].1);
+        let first_col_count = count_table_columns(&first_tables[0].markdown);
         if first_col_count == 0 {
             i += 1;
             continue;
@@ -259,7 +652,7 @@ pub(super) fn merge_continuation_tables(
                 _ => break,
             };
 
-            let next_col_count = count_table_columns(&next_tables[0].1);
+            let next_col_count = count_table_columns(&next_tables[0].markdown);
             if next_col_count != first_col_count {
                 break;
             }
@@ -273,7 +666,7 @@ pub(super) fn merge_continuation_tables(
             let mut extra_rows = String::new();
             for &cont_page in &continuation_pages {
                 if let Some(tables) = page_tables.get(&cont_page) {
-                    let table_md = &tables[0].1;
+                    let table_md = &tables[0].markdown;
                     // Skip header row (line 1) and separator row (line 2), keep the rest
                     for (line_idx, line) in table_md.lines().enumerate() {
                         if line_idx >= 2 {
@@ -286,7 +679,7 @@ pub(super) fn merge_continuation_tables(
 
             // Append continuation rows to the first page's table
             if let Some(tables) = page_tables.get_mut(&first_page) {
-                tables[0].1.push_str(&extra_rows);
+                tables[0].markdown.push_str(&extra_rows);
             }
 
             // Remove continuation pages from the map
@@ -318,37 +711,35 @@ fn count_table_columns(table_md: &str) -> usize {
 /// Flush any remaining tables and images for a given page
 fn flush_page_tables_and_images(
     page: u32,
-    page_tables: &std::collections::HashMap<u32, Vec<(f32, String)>>,
-    page_images: &std::collections::HashMap<u32, Vec<(f32, String)>>,
+    page_blocks: &HashMap<u32, Vec<PositionedBlockRef<'_>>>,
     inserted_tables: &mut HashSet<(u32, usize)>,
     inserted_images: &mut HashSet<(u32, usize)>,
     output: &mut String,
     in_paragraph: &mut bool,
 ) {
-    if let Some(tables) = page_tables.get(&page) {
-        for (idx, (_, table_md)) in tables.iter().enumerate() {
-            if !inserted_tables.contains(&(page, idx)) {
-                if *in_paragraph {
-                    output.push_str("\n\n");
-                    *in_paragraph = false;
-                }
-                output.push('\n');
-                output.push_str(table_md);
-                output.push('\n');
+    let Some(blocks) = page_blocks.get(&page) else {
+        return;
+    };
+    for &(kind, idx, block) in blocks {
+        let already_inserted = match kind {
+            PositionedBlockKind::Table => inserted_tables.contains(&(page, idx)),
+            PositionedBlockKind::Image => inserted_images.contains(&(page, idx)),
+        };
+        if already_inserted {
+            continue;
+        }
+        if *in_paragraph {
+            output.push_str("\n\n");
+            *in_paragraph = false;
+        }
+        output.push('\n');
+        output.push_str(&block.markdown);
+        output.push('\n');
+        match kind {
+            PositionedBlockKind::Table => {
                 inserted_tables.insert((page, idx));
             }
-        }
-    }
-    if let Some(images) = page_images.get(&page) {
-        for (idx, (_, image_md)) in images.iter().enumerate() {
-            if !inserted_images.contains(&(page, idx)) {
-                if *in_paragraph {
-                    output.push_str("\n\n");
-                    *in_paragraph = false;
-                }
-                output.push('\n');
-                output.push_str(image_md);
-                output.push('\n');
+            PositionedBlockKind::Image => {
                 inserted_images.insert((page, idx));
             }
         }
@@ -359,8 +750,9 @@ fn flush_page_tables_and_images(
 pub(super) fn to_markdown_from_lines_with_tables_and_images(
     lines: Vec<TextLine>,
     options: MarkdownOptions,
-    page_tables: std::collections::HashMap<u32, Vec<(f32, String)>>,
-    page_images: std::collections::HashMap<u32, Vec<(f32, String)>>,
+    page_tables: std::collections::HashMap<u32, Vec<PositionedMarkdown>>,
+    page_images: std::collections::HashMap<u32, Vec<PositionedMarkdown>>,
+    page_chart_regions: &std::collections::HashMap<u32, Vec<(f32, f32, f32, f32)>>,
     band_split_pages: &HashSet<u32>,
     struct_roles: Option<
         &std::collections::HashMap<u32, std::collections::HashMap<i64, StructRole>>,
@@ -375,6 +767,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     let base_size = options
         .base_font_size
         .unwrap_or(font_stats.most_common_size);
+    let base_size = super::analysis::correct_base_size(&lines, base_size);
 
     // Merge drop caps with following text
     let lines = merge_drop_caps(lines, base_size);
@@ -391,12 +784,52 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     // threshold and cause every line to be treated as a paragraph break.
     let para_threshold = compute_paragraph_threshold(&lines, base_size);
 
+    // Merge wrapped bold headings: a 2-3 line group of consecutive all-bold
+    // body-size lines that is isolated as a group (paragraph break before
+    // and after) is one heading that wrapped. Left split, the internal line
+    // gap breaks each line's isolation and neither classifies as a heading —
+    // the whole group then merges into the following body paragraph.
+    let lines = if std::env::var("PI_NO_MERGE").is_ok() {
+        lines
+    } else {
+        merge_wrapped_bold_heading_groups(lines, base_size, para_threshold)
+    };
+
     // Pre-scan: identify isolated lines (paragraph break before AND after).
     // These are heading candidates even without bold/large font — common in
     // academic papers where section titles like "Acknowledgements" sit alone
     // between paragraphs at body font size. Inspired by opendataloader's
     // lookahead in HeadingProcessor (prevNode/nextNode context).
     let isolated_lines = find_isolated_lines(&lines, base_size, para_threshold);
+    let (wrapped_bold_paragraph_lines, wrapped_quoted_paragraph_lines) =
+        find_wrapped_bold_paragraph_lines(&lines, base_size, para_threshold);
+
+    let mut sequence_excluded_lines = wrapped_bold_paragraph_lines.clone();
+    for (line_idx, line) in lines.iter().enumerate() {
+        if page_chart_regions.get(&line.page).is_some_and(|regions| {
+            line.items
+                .iter()
+                .any(|item| item_is_in_chart_region(item, regions))
+        }) {
+            sequence_excluded_lines.insert(line_idx);
+        }
+    }
+    if let Some(roles) = struct_roles {
+        for (line_idx, line) in lines.iter().enumerate() {
+            if resolve_line_struct_role(line, roles)
+                .is_some_and(|role| role.is_non_heading_content())
+            {
+                sequence_excluded_lines.insert(line_idx);
+            }
+        }
+    }
+    let sequence_heading_levels = classify_heading_sequences(
+        &lines,
+        base_size,
+        &heading_tiers,
+        &isolated_lines,
+        &sequence_excluded_lines,
+    );
 
     // Detect struct heading levels that are overused (body text mistagged as headings)
     let overused_heading_levels = detect_overused_struct_heading_levels(&lines, struct_roles);
@@ -408,8 +841,30 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     let mut in_list = false;
     let mut in_paragraph = false;
     let mut last_list_x: Option<f32> = None;
+    // Code lines accumulate here and the fence is emitted only when the
+    // block flushes with content — an empty ``` ``` pair can never appear.
+    fn flush_code_block(output: &mut String, pending_code: &mut String) {
+        let trimmed = pending_code.trim();
+        // A fragment too short to be code — a lone ® or stray glyph set in
+        // a mono face — reads better as plain text than as a fenced block.
+        if trimmed.chars().count() < 3 {
+            if !trimmed.is_empty() {
+                output.push_str(trimmed);
+                output.push_str("\n\n");
+            }
+        } else {
+            output.push_str("```\n");
+            output.push_str(pending_code);
+            output.push_str("```\n");
+        }
+        pending_code.clear();
+    }
+
     let mut in_code_block = false;
+    let mut pending_code = String::new();
     let mut prev_had_dot_leaders = false;
+    let mut paragraph_in_wrapped_bold_run = false;
+    let mut toc_suppress_page: Option<u32> = None;
     let mut inserted_tables: HashSet<(u32, usize)> = HashSet::new();
     let mut inserted_images: HashSet<(u32, usize)> = HashSet::new();
 
@@ -421,6 +876,18 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         .collect();
     all_content_pages.sort();
     all_content_pages.dedup();
+    // Build the unified table/image order once per page. This is only a
+    // meaningful sort on chart/prose pages; ordinary pages retain their
+    // legacy table-then-image order without repeating work for every line.
+    let page_blocks: HashMap<u32, Vec<PositionedBlockRef<'_>>> = all_content_pages
+        .iter()
+        .map(|&page| {
+            (
+                page,
+                positioned_blocks_for_page(page, &page_tables, &page_images),
+            )
+        })
+        .collect();
 
     for (line_idx, line) in lines.iter().enumerate() {
         // Page break
@@ -428,13 +895,12 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             // Flush current page's remaining tables and images
             if current_page > 0 {
                 if in_code_block {
-                    output.push_str("```\n");
+                    flush_code_block(&mut output, &mut pending_code);
                     in_code_block = false;
                 }
                 flush_page_tables_and_images(
                     current_page,
-                    &page_tables,
-                    &page_images,
+                    &page_blocks,
                     &mut inserted_tables,
                     &mut inserted_images,
                     &mut output,
@@ -458,8 +924,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 }
                 flush_page_tables_and_images(
                     p,
-                    &page_tables,
-                    &page_images,
+                    &page_blocks,
                     &mut inserted_tables,
                     &mut inserted_images,
                     &mut output,
@@ -475,42 +940,47 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             current_page = line.page;
             prev_y = f32::MAX;
             prev_x = 0.0;
+            paragraph_in_wrapped_bold_run = false;
 
             if options.include_page_numbers {
                 output.push_str(&format!("<!-- Page {} -->\n\n", current_page));
             }
         }
 
-        // Check if we should insert a table before this line
-        if let Some(tables) = page_tables.get(&current_page) {
-            for (idx, (table_y, table_md)) in tables.iter().enumerate() {
-                // Insert table when we pass its Y position
-                if *table_y > line.y && !inserted_tables.contains(&(current_page, idx)) {
+        // Insert tables and images through one ordered stream. Chart/prose
+        // pages sort by zone, column, and physical Y; ordinary pages retain
+        // the legacy table-then-image input order.
+        if let Some(blocks) = page_blocks.get(&current_page) {
+            for &(kind, idx, block) in blocks {
+                let already_inserted = match kind {
+                    PositionedBlockKind::Table => inserted_tables.contains(&(current_page, idx)),
+                    PositionedBlockKind::Image => inserted_images.contains(&(current_page, idx)),
+                };
+                if positioned_block_precedes_line(block, line) && !already_inserted {
+                    // Code lines buffer until their block closes; flush them
+                    // first so this block cannot jump ahead of code that
+                    // precedes it in reading order. A code line after the
+                    // block reopens a new fence naturally.
+                    if in_code_block {
+                        flush_code_block(&mut output, &mut pending_code);
+                        in_code_block = false;
+                    }
                     if in_paragraph {
                         output.push_str("\n\n");
                         in_paragraph = false;
+                        paragraph_in_wrapped_bold_run = false;
                     }
                     output.push('\n');
-                    output.push_str(table_md);
+                    output.push_str(&block.markdown);
                     output.push('\n');
-                    inserted_tables.insert((current_page, idx));
-                }
-            }
-        }
-
-        // Check if we should insert an image before this line
-        if let Some(images) = page_images.get(&current_page) {
-            for (idx, (image_y, image_md)) in images.iter().enumerate() {
-                // Insert image when we pass its Y position
-                if *image_y > line.y && !inserted_images.contains(&(current_page, idx)) {
-                    if in_paragraph {
-                        output.push_str("\n\n");
-                        in_paragraph = false;
+                    match kind {
+                        PositionedBlockKind::Table => {
+                            inserted_tables.insert((current_page, idx));
+                        }
+                        PositionedBlockKind::Image => {
+                            inserted_images.insert((current_page, idx));
+                        }
                     }
-                    output.push('\n');
-                    output.push_str(image_md);
-                    output.push('\n');
-                    inserted_images.insert((current_page, idx));
                 }
             }
         }
@@ -527,17 +997,31 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             && y_gap.abs() <= para_threshold
             && (prev_x - line_x).abs() > 50.0
             && prev_y < f32::MAX;
-        if (is_para_break || is_band_switch) && in_paragraph {
+        let line_all_bold = !line.items.is_empty() && line.items.iter().all(|item| item.is_bold);
+        let line_in_wrapped_bold_run = wrapped_bold_paragraph_lines.contains(&line_idx);
+        let is_bold_to_regular_break = in_paragraph
+            && paragraph_in_wrapped_bold_run
+            && !line_in_wrapped_bold_run
+            && !line_all_bold
+            && y_gap > base_size * 1.2
+            && y_gap <= para_threshold;
+        if (is_para_break || is_band_switch || is_bold_to_regular_break) && in_paragraph {
             output.push_str("\n\n");
             in_paragraph = false;
+            paragraph_in_wrapped_bold_run = false;
         }
         // Don't immediately end list on paragraph break
         // Let the continuation check below decide if we're still in a list
+        let (prior_y, prior_x) = (prev_y, prev_x);
         prev_y = line.y;
         prev_x = line_x;
 
         // Get text with optional bold/italic formatting
-        let text = line.text_with_formatting(options.detect_bold, options.detect_italic);
+        let text = line.text_with_formatting(
+            options.detect_bold,
+            options.detect_italic,
+            options.detect_underline,
+        );
         let trimmed = text.trim();
 
         // Also get plain text for pattern matching (list detection, captions, etc.)
@@ -552,15 +1036,42 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         // These should be on their own line followed by a paragraph break
         let struct_role = struct_roles.and_then(|roles| resolve_line_struct_role(line, roles));
 
-        // Determine if this line is code (struct-tree or font-based) for block accumulation
+        // Determine if this line is code (struct-tree or font-based) for
+        // block accumulation. Font-based detection only opens a block at a
+        // paragraph boundary: a mono-set line that continues an open prose
+        // paragraph is the producer smearing an inline code literal's style
+        // across a wrapped line (HTML-to-PDF exports do this), and fencing
+        // it would cut the sentence in three.
         let is_code_line = struct_role
             .as_ref()
             .is_some_and(|r| matches!(r, StructRole::Code))
-            || (options.detect_code && line.items.iter().any(|i| is_monospace_font(&i.font)));
+            || (options.detect_code
+                && (in_code_block || !in_paragraph)
+                && super::classify::line_is_monospace(line));
+        if !in_code_block
+            && !is_code_line
+            && !is_para_break
+            && !is_band_switch
+            && is_leader_continuation(plain_trimmed)
+            && extend_leader(&mut output, plain_trimmed)
+        {
+            // The tail of a leader painted as its own run has been folded
+            // into the leader line before it; nothing else about the state
+            // changes, so the next line is treated exactly as if this one
+            // had not been painted. Only a vertically adjacent run in the
+            // same band counts (a paragraph-sized gap or the other column
+            // means the dots belong to nothing), a run with no leader line before it (a table's "rows omitted"
+            // ellipsis, a stray leader) keeps its usual handling below, and
+            // a monospace run is code. The next line measures its gap and
+            // band from the text line, not from the tail.
+            prev_y = prior_y;
+            prev_x = prior_x;
+            continue;
+        }
 
         // Close code block when transitioning to non-code
         if in_code_block && !is_code_line {
-            output.push_str("```\n");
+            flush_code_block(&mut output, &mut pending_code);
             in_code_block = false;
         }
 
@@ -572,6 +1083,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             if in_paragraph {
                 output.push_str("\n\n");
                 in_paragraph = false;
+                paragraph_in_wrapped_bold_run = false;
             }
             output.push_str(trimmed);
             output.push_str("\n\n");
@@ -605,14 +1117,32 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 _ => false,
             };
 
+        // Lines explicitly tagged with a non-heading content role must never
+        // be promoted by the visual heuristic — a tagged list item, quote, or
+        // code line can look exactly like a heading (short, isolated).
+        let non_heading_role = struct_role
+            .as_ref()
+            .is_some_and(StructRole::is_non_heading_content);
         let heuristic_heading = if options.detect_headers
+            && !non_heading_role
+            && !wrapped_quoted_paragraph_lines.contains(&line_idx)
+            && !is_code_line
             && !looks_like_list_continuation
             && plain_trimmed.len() > 3
             && plain_trimmed.split_whitespace().count() <= 15
             && !starts_with_bullet_marker(plain_trimmed)
+            && !is_toc_entry_line(plain_trimmed)
+            && !is_heading_fragment(plain_trimmed)
+            && toc_suppress_page != Some(line.page)
         {
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
-            detect_header_level(line_font_size, base_size, &heading_tiers).or_else(|| {
+            detect_header_level(
+                line_font_size,
+                base_size,
+                &heading_tiers,
+                crate::markdown::analysis::line_is_mostly_bold(line),
+            )
+            .or_else(|| {
                 // Rarity-based heading detection (inspired by opendataloader).
                 // Heading probability scoring with lookahead context.
                 // Score = rarity * 0.5 + bold * 0.3 + standalone * 0.2
@@ -623,6 +1153,9 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 }
                 let word_count = plain_trimmed.split_whitespace().count();
                 if !(1..=15).contains(&word_count) {
+                    return None;
+                }
+                if wrapped_bold_paragraph_lines.contains(&line_idx) {
                     return None;
                 }
                 let rarity = font_size_rarity(line_font_size, &font_stats);
@@ -642,12 +1175,23 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 // paragraph continuity and minor font-size variation
                 // inflates rarity scores.
                 let has_strong_signal = all_bold || isolated || (rarity >= 0.97 && word_count <= 8);
-                if score >= 0.5 && standalone && word_count >= 2 && has_strong_signal {
+                // Single-word headings ("IMPLEMENTATION", "CONTENTS",
+                // "Replace") are common. All-bold single words qualify when
+                // standalone (paragraph break before / page top) — headings
+                // hug their section's first paragraph, so requiring a break
+                // after as well missed most of them. Mixed bold lead-ins
+                // ("Note: ...") are excluded by all_bold.
+                let enough_words = word_count >= 2 || (all_bold && plain_trimmed.len() >= 4);
+                let numbered_bold = all_bold && starts_with_section_number(plain_trimmed);
+                if numbered_bold
+                    || (score >= 0.5 && standalone && enough_words && has_strong_signal)
+                {
                     Some(bold_heading_level(&heading_tiers))
                 } else {
                     None
                 }
             })
+            .or_else(|| sequence_heading_levels.get(&line_idx).copied())
         } else {
             None
         };
@@ -656,10 +1200,20 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             if in_paragraph {
                 output.push_str("\n\n");
                 in_paragraph = false;
+                paragraph_in_wrapped_bold_run = false;
             }
             let prefix = "#".repeat(level);
-            // Use plain text for headers to avoid redundant formatting
-            output.push_str(&format!("{} {}\n\n", prefix, plain_trimmed));
+            // Plain text for headers (no redundant bold/italic inside `#`),
+            // but underline is preserved: `<u>` carries meaning `#` doesn't.
+            let heading_text = if options.detect_underline {
+                line.text_with_formatting(false, false, true)
+            } else {
+                plain_text.clone()
+            };
+            output.push_str(&format!("{} {}\n\n", prefix, heading_text.trim()));
+            if is_toc_marker_heading(plain_trimmed) {
+                toc_suppress_page = Some(line.page);
+            }
             in_list = false;
             continue;
         }
@@ -678,6 +1232,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             if in_paragraph {
                 output.push_str("\n\n");
                 in_paragraph = false;
+                paragraph_in_wrapped_bold_run = false;
             }
             output.push_str(&format!("- {}", trimmed));
             output.push('\n');
@@ -691,6 +1246,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             if in_paragraph {
                 output.push_str("\n\n");
                 in_paragraph = false;
+                paragraph_in_wrapped_bold_run = false;
             }
             let formatted = format_list_item(trimmed);
             output.push_str(&formatted);
@@ -737,6 +1293,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             if in_paragraph {
                 output.push_str("\n\n");
                 in_paragraph = false;
+                paragraph_in_wrapped_bold_run = false;
             }
             output.push_str(&format!("> {}\n", trimmed));
             continue;
@@ -747,13 +1304,11 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             if in_paragraph {
                 output.push_str("\n\n");
                 in_paragraph = false;
+                paragraph_in_wrapped_bold_run = false;
             }
-            if !in_code_block {
-                output.push_str("```\n");
-                in_code_block = true;
-            }
-            output.push_str(plain_trimmed);
-            output.push('\n');
+            in_code_block = true;
+            pending_code.push_str(plain_trimmed);
+            pending_code.push('\n');
             continue;
         }
 
@@ -767,21 +1322,25 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             }
         }
         output.push_str(trimmed);
+        paragraph_in_wrapped_bold_run = if in_paragraph {
+            paragraph_in_wrapped_bold_run || line_in_wrapped_bold_run
+        } else {
+            line_in_wrapped_bold_run
+        };
         in_paragraph = true;
         prev_had_dot_leaders = cur_dot_leaders;
     }
 
     // Close any trailing code block
     if in_code_block {
-        output.push_str("```\n");
+        flush_code_block(&mut output, &mut pending_code);
     }
 
     // Flush current page and any remaining pages with tables/images
     // (handles table-only pages after the last text line, and trailing image-only pages)
     flush_page_tables_and_images(
         current_page,
-        &page_tables,
-        &page_images,
+        &page_blocks,
         &mut inserted_tables,
         &mut inserted_images,
         &mut output,
@@ -793,8 +1352,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         }
         flush_page_tables_and_images(
             p,
-            &page_tables,
-            &page_images,
+            &page_blocks,
             &mut inserted_tables,
             &mut inserted_images,
             &mut output,
@@ -812,6 +1370,72 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
 }
 
 /// Convert text lines to markdown
+/// Inline markup the converters emit around a line's text.
+const MARKUP_TOKENS: [&str; 10] = [
+    "**", "*", "<u>", "</u>", "<s>", "</s>", "<sup>", "</sup>", "<sub>", "</sub>",
+];
+
+/// A line made only of dots is the tail of the previous line's leader,
+/// painted as a separate run. When the line emitted just before it (one
+/// newline back: a paragraph or page break means the dots belong to
+/// nothing) is text ending in its leader (`Total assets....`, four or more
+/// dots; a period or an ellipsis does not count), extend that leader with the
+/// dots, inside any closing emphasis or underline markup, and report true.
+/// Otherwise nothing is touched: the caller gives the line its usual
+/// handling. This looks at the output rather than paragraph state because a
+/// list item or heading may have closed the paragraph.
+fn extend_leader(output: &mut String, dots: &str) -> bool {
+    // Paragraph lines are separated lazily, so the previous line may still
+    // lack its newline; more than one newline is a paragraph or page break.
+    let body_len = output.trim_end_matches('\n').len();
+    if output.len() - body_len > 1 {
+        return false;
+    }
+    let line_start = output[..body_len].rfind('\n').map_or(0, |i| i + 1);
+    let last_line = &output[line_start..body_len];
+    // Closing markup after the leader: `**`, `*`, `</u>`, `</s>`, `</sup>`,
+    // `</sub>`.
+    let mut text_end = last_line.len();
+    loop {
+        let head = &last_line[..text_end];
+        let Some(stripped) = ["**", "*", "</u>", "</s>", "</sup>", "</sub>"]
+            .iter()
+            .find_map(|m| head.strip_suffix(m))
+        else {
+            break;
+        };
+        text_end = stripped.len();
+    }
+    // Judge the leader on the text itself, with any inline markup removed:
+    // a run of four or more dots starting at a standalone dot (not a
+    // sentence, an ellipsis or `Wait. . . .`) after a label of its own,
+    // which may be a number (`12......`) but not more dots (`<u>....</u>`).
+    let plain: String = MARKUP_TOKENS
+        .iter()
+        .fold(last_line[..text_end].to_string(), |acc, m| {
+            acc.replace(m, "")
+        });
+    if trailing_leader_dots(&plain) < 4
+        || !has_dot_leaders(&plain)
+        || !plain.chars().any(char::is_alphanumeric)
+    {
+        return false;
+    }
+    // Match the line's own leader style: a spaced leader (`. . . .`) takes
+    // its tail spaced too, so the punctuation-spacing pass collapses the
+    // whole run at once instead of leaving a seam (`. . . ....`).
+    let tail = plain.trim_end_matches([' ', '.']).len();
+    let spaced = plain[tail..].trim().contains(' ');
+    let count = dots.chars().filter(|c| *c == '.').count();
+    let run = if spaced {
+        " .".repeat(count)
+    } else {
+        ".".repeat(count)
+    };
+    output.insert_str(line_start + text_end, &run);
+    true
+}
+
 pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) -> String {
     if lines.is_empty() {
         return String::new();
@@ -822,6 +1446,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
     let base_size = options
         .base_font_size
         .unwrap_or(font_stats.most_common_size);
+    let base_size = super::analysis::correct_base_size(&lines, base_size);
 
     // Merge drop caps with following text
     let lines = merge_drop_caps(lines, base_size);
@@ -836,6 +1461,15 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
     let para_threshold = compute_paragraph_threshold(&lines, base_size);
 
     let isolated_lines = find_isolated_lines(&lines, base_size, para_threshold);
+    let (wrapped_bold_paragraph_lines, wrapped_quoted_paragraph_lines) =
+        find_wrapped_bold_paragraph_lines(&lines, base_size, para_threshold);
+    let sequence_heading_levels = classify_heading_sequences(
+        &lines,
+        base_size,
+        &heading_tiers,
+        &isolated_lines,
+        &wrapped_bold_paragraph_lines,
+    );
 
     let mut output = String::new();
     let mut current_page = 0u32;
@@ -844,6 +1478,8 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
     let mut in_paragraph = false;
     let mut last_list_x: Option<f32> = None;
     let mut prev_had_dot_leaders = false;
+    let mut paragraph_in_wrapped_bold_run = false;
+    let mut toc_suppress_page: Option<u32> = None;
 
     for (line_idx, line) in lines.iter().enumerate() {
         // Page break
@@ -860,6 +1496,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             in_list = false;
             last_list_x = None;
             prev_had_dot_leaders = false;
+            paragraph_in_wrapped_bold_run = false;
 
             if options.include_page_numbers {
                 output.push_str(&format!("<!-- Page {} -->\n\n", current_page));
@@ -870,16 +1507,30 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         // (newspaper columns emitted sequentially on the same page).
         let y_gap = prev_y - line.y;
         let is_para_break = y_gap.abs() > para_threshold;
-        if is_para_break && in_paragraph {
+        let line_all_bold = !line.items.is_empty() && line.items.iter().all(|item| item.is_bold);
+        let line_in_wrapped_bold_run = wrapped_bold_paragraph_lines.contains(&line_idx);
+        let is_bold_to_regular_break = in_paragraph
+            && paragraph_in_wrapped_bold_run
+            && !line_in_wrapped_bold_run
+            && !line_all_bold
+            && y_gap > base_size * 1.2
+            && y_gap <= para_threshold;
+        if (is_para_break || is_bold_to_regular_break) && in_paragraph {
             output.push_str("\n\n");
             in_paragraph = false;
+            paragraph_in_wrapped_bold_run = false;
         }
         // Don't immediately end list on paragraph break
         // Let the continuation check below decide if we're still in a list
+        let prior_y = prev_y;
         prev_y = line.y;
 
         // Get text with optional bold/italic formatting
-        let text = line.text_with_formatting(options.detect_bold, options.detect_italic);
+        let text = line.text_with_formatting(
+            options.detect_bold,
+            options.detect_italic,
+            options.detect_underline,
+        );
         let trimmed = text.trim();
 
         // Also get plain text for pattern matching
@@ -889,6 +1540,23 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         if trimmed.is_empty() {
             continue;
         }
+        if !is_para_break
+            && !(options.detect_code && super::classify::line_is_monospace(line))
+            && is_leader_continuation(plain_trimmed)
+            && extend_leader(&mut output, plain_trimmed)
+        {
+            // The tail of a leader painted as its own run has been folded
+            // into the leader line before it; nothing else about the state
+            // changes, so the next line is treated exactly as if this one
+            // had not been painted. Only a vertically adjacent run counts
+            // (a paragraph-sized gap means the dots belong to nothing), a
+            // run with no leader line before it (a table's "rows omitted"
+            // ellipsis, a stray leader) keeps its usual handling below, and
+            // a monospace run is code for the block detection further down.
+            // The next line measures its gap from the text line, not the tail.
+            prev_y = prior_y;
+            continue;
+        }
 
         // Detect figure/table captions and source citations
         // These should be on their own line followed by a paragraph break
@@ -896,6 +1564,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             if in_paragraph {
                 output.push_str("\n\n");
                 in_paragraph = false;
+                paragraph_in_wrapped_bold_run = false;
             }
             output.push_str(trimmed);
             output.push_str("\n\n");
@@ -905,40 +1574,65 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         // Detect headers by font size
         // Skip very short text (drop caps/labels) and very long text (body paragraphs)
         if options.detect_headers
+            && !wrapped_quoted_paragraph_lines.contains(&line_idx)
             && plain_trimmed.len() > 3
             && plain_trimmed.split_whitespace().count() <= 15
+            && !is_toc_entry_line(plain_trimmed)
+            && !is_heading_fragment(plain_trimmed)
+            && toc_suppress_page != Some(line.page)
+            && !(options.detect_code && super::classify::line_is_monospace(line))
         {
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
-            if let Some(header_level) =
-                detect_header_level(line_font_size, base_size, &heading_tiers).or_else(|| {
-                    if line_font_size < base_size * 0.95 {
-                        return None;
-                    }
-                    let word_count = plain_trimmed.split_whitespace().count();
-                    if !(1..=15).contains(&word_count) {
-                        return None;
-                    }
-                    let rarity = font_size_rarity(line_font_size, &font_stats);
-                    let all_bold = !line.items.is_empty() && line.items.iter().all(|i| i.is_bold);
-                    let standalone = !in_paragraph;
-                    let isolated = isolated_lines.contains(&line_idx);
-                    let score = rarity * 0.5
-                        + if all_bold { 0.3 } else { 0.0 }
-                        + if standalone { 0.2 } else { 0.0 }
-                        + if isolated { 0.3 } else { 0.0 };
-                    if score >= 0.5 && standalone && word_count >= 2 {
-                        return Some(bold_heading_level(&heading_tiers));
-                    }
-                    None
-                })
+            if let Some(header_level) = detect_header_level(
+                line_font_size,
+                base_size,
+                &heading_tiers,
+                crate::markdown::analysis::line_is_mostly_bold(line),
+            )
+            .or_else(|| {
+                if line_font_size < base_size * 0.95 {
+                    return None;
+                }
+                let word_count = plain_trimmed.split_whitespace().count();
+                if !(1..=15).contains(&word_count) {
+                    return None;
+                }
+                if wrapped_bold_paragraph_lines.contains(&line_idx) {
+                    return None;
+                }
+                let rarity = font_size_rarity(line_font_size, &font_stats);
+                let all_bold = !line.items.is_empty() && line.items.iter().all(|i| i.is_bold);
+                let standalone = !in_paragraph;
+                let isolated = isolated_lines.contains(&line_idx);
+                let score = rarity * 0.5
+                    + if all_bold { 0.3 } else { 0.0 }
+                    + if standalone { 0.2 } else { 0.0 }
+                    + if isolated { 0.3 } else { 0.0 };
+                let enough_words =
+                    word_count >= 2 || (all_bold && isolated && plain_trimmed.len() >= 4);
+                if score >= 0.5 && standalone && enough_words {
+                    return Some(bold_heading_level(&heading_tiers));
+                }
+                None
+            })
+            .or_else(|| sequence_heading_levels.get(&line_idx).copied())
             {
                 if in_paragraph {
                     output.push_str("\n\n");
                     in_paragraph = false;
+                    paragraph_in_wrapped_bold_run = false;
                 }
                 let prefix = "#".repeat(header_level);
-                // Use plain text for headers to avoid redundant formatting
-                output.push_str(&format!("{} {}\n\n", prefix, plain_trimmed));
+                // Plain text for headers, except underline (see above).
+                let heading_text = if options.detect_underline {
+                    line.text_with_formatting(false, false, true)
+                } else {
+                    plain_text.clone()
+                };
+                output.push_str(&format!("{} {}\n\n", prefix, heading_text.trim()));
+                if is_toc_marker_heading(plain_trimmed) {
+                    toc_suppress_page = Some(line.page);
+                }
                 in_list = false;
                 continue;
             }
@@ -949,6 +1643,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             if in_paragraph {
                 output.push_str("\n\n");
                 in_paragraph = false;
+                paragraph_in_wrapped_bold_run = false;
             }
             let formatted = format_list_item(trimmed);
             output.push_str(&formatted);
@@ -986,18 +1681,13 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             }
         }
 
-        // Detect code blocks by font
-        if options.detect_code {
-            let is_mono = line.items.iter().any(|i| is_monospace_font(&i.font));
-            if is_mono {
-                if in_paragraph {
-                    output.push_str("\n\n");
-                    in_paragraph = false;
-                }
-                // Use plain text for code blocks
-                output.push_str(&format!("```\n{}\n```\n", plain_trimmed));
-                continue;
-            }
+        // Detect code blocks by font. Only at a paragraph boundary — a
+        // mono-set line continuing an open prose paragraph is an inline
+        // code literal's style smeared across a wrapped line, not code.
+        if options.detect_code && !in_paragraph && super::classify::line_is_monospace(line) {
+            // Use plain text for code blocks
+            output.push_str(&format!("```\n{}\n```\n", plain_trimmed));
+            continue;
         }
 
         // Regular text - join lines within same paragraph with space
@@ -1010,6 +1700,11 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             }
         }
         output.push_str(trimmed);
+        paragraph_in_wrapped_bold_run = if in_paragraph {
+            paragraph_in_wrapped_bold_run || line_in_wrapped_bold_run
+        } else {
+            line_in_wrapped_bold_run
+        };
         in_paragraph = true;
         prev_had_dot_leaders = cur_dot_leaders;
     }
@@ -1025,6 +1720,20 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn section_number_prefix_detection() {
+        assert!(starts_with_section_number(
+            "9.5. Adapting to the New Normal"
+        ));
+        assert!(starts_with_section_number("12.3.1. Deep subsection"));
+        assert!(starts_with_section_number("2.1 Systems thinking"));
+        assert!(!starts_with_section_number("1. First item in a list"));
+        assert!(!starts_with_section_number("24% in October 2020."));
+        assert!(!starts_with_section_number("2020 was a hard year"));
+        assert!(!starts_with_section_number("Introduction"));
+    }
+
     use super::*;
     use crate::structure_tree::StructRole;
     use crate::types::TextItem;
@@ -1038,12 +1747,25 @@ mod tests {
             width: 100.0,
             height: 12.0,
             font: "Helvetica".to_string(),
+            font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: 12.0,
             page,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
+            is_underline: false,
+            is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: crate::types::ItemType::Text,
             mcid,
+            baseline_shift: 0.0,
         }
     }
 
@@ -1056,6 +1778,127 @@ mod tests {
             page,
             adaptive_threshold: 0.10,
         }
+    }
+
+    fn line_at(text: &str, page: u32, y: f32) -> TextLine {
+        let mut item = make_item(text, page, None);
+        item.y = y;
+        make_line(vec![item])
+    }
+
+    #[test]
+    fn chart_page_blocks_follow_zone_and_column_stream() {
+        let line = |text: &str, x: f32, y: f32| {
+            let mut item = make_item(text, 1, None);
+            item.x = x;
+            item.y = y;
+            make_line(vec![item])
+        };
+        // Logical newspaper order for the prose zone: all left-column lines,
+        // then all right-column lines, even though their physical Y values
+        // jump back upward at the column switch.
+        let lines = vec![
+            line("Left column upper prose.", 90.0, 700.0),
+            line("Left column lower prose.", 90.0, 500.0),
+            line("Right column upper prose.", 340.0, 700.0),
+            line("Right column lower prose.", 340.0, 500.0),
+        ];
+        let order = ChartProseOrder::new(280.0, (100.0, 300.0, 500.0, 400.0));
+        let mut tables = HashMap::new();
+        tables.insert(
+            1,
+            vec![
+                // Detection order is deliberately right before left.
+                PositionedMarkdown::new(
+                    600.0,
+                    340.0,
+                    "| Right metric | Value |\n|---|---|\n| A | 1 |\n".into(),
+                    Some(order),
+                ),
+                PositionedMarkdown::new(
+                    550.0,
+                    90.0,
+                    "| Left metric | Value |\n|---|---|\n| B | 2 |\n".into(),
+                    Some(order),
+                ),
+            ],
+        );
+        let mut images = HashMap::new();
+        images.insert(
+            1,
+            vec![
+                PositionedMarkdown::new(
+                    575.0,
+                    90.0,
+                    "![Left column figure](left-image)\n".into(),
+                    Some(order),
+                ),
+                PositionedMarkdown::new(
+                    575.0,
+                    340.0,
+                    "![Right column figure](right-image)\n".into(),
+                    Some(order),
+                ),
+            ],
+        );
+
+        let md = to_markdown_from_lines_with_tables_and_images(
+            lines,
+            MarkdownOptions::default(),
+            tables,
+            images,
+            &HashMap::new(),
+            &HashSet::from([1]),
+            None,
+        );
+        let positions = [
+            "Left column upper prose.",
+            "![Left column figure](left-image)",
+            "| Left metric | Value |",
+            "Left column lower prose.",
+            "Right column upper prose.",
+            "| Right metric | Value |",
+            "![Right column figure](right-image)",
+            "Right column lower prose.",
+        ]
+        .map(|needle| {
+            md.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle:?} in {md}"))
+        });
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "blocks must follow the logical chart-page stream: {md}"
+        );
+    }
+
+    #[test]
+    fn isolated_lines_kept_on_sparse_pages() {
+        // A ToC page with a lone title and one entry far below: the density
+        // ratio is 50% but the page is too sparse for the multi-column
+        // misfire the guard targets — the title must stay isolated.
+        let lines = vec![
+            line_at("CONTENTS", 1, 700.0),
+            line_at("Chapter One 5", 1, 500.0),
+        ];
+        let isolated = find_isolated_lines(&lines, 12.0, 20.0);
+        assert!(
+            isolated.contains(&0),
+            "sparse-page title must stay isolated"
+        );
+    }
+
+    #[test]
+    fn isolated_lines_wiped_on_dense_pages() {
+        // 12 short lines all with paragraph gaps — the multi-column misfire
+        // shape. The guard must clear them all.
+        let lines: Vec<TextLine> = (0..12)
+            .map(|i| line_at("Short column line", 1, 700.0 - i as f32 * 50.0))
+            .collect();
+        let isolated = find_isolated_lines(&lines, 12.0, 20.0);
+        assert!(
+            isolated.is_empty(),
+            "dense page of isolated lines must be wiped"
+        );
     }
 
     #[test]
@@ -1080,6 +1923,7 @@ mod tests {
             MarkdownOptions::default(),
             HashMap::new(),
             HashMap::new(),
+            &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
         );
@@ -1108,6 +1952,7 @@ mod tests {
             MarkdownOptions::default(),
             HashMap::new(),
             HashMap::new(),
+            &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
         );
@@ -1149,6 +1994,7 @@ mod tests {
             MarkdownOptions::default(),
             HashMap::new(),
             HashMap::new(),
+            &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
         );
@@ -1185,6 +2031,7 @@ mod tests {
             MarkdownOptions::default(),
             HashMap::new(),
             HashMap::new(),
+            &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
         );
@@ -1220,6 +2067,7 @@ mod tests {
             MarkdownOptions::default(),
             HashMap::new(),
             HashMap::new(),
+            &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
         );
@@ -1249,6 +2097,7 @@ mod tests {
             MarkdownOptions::default(),
             HashMap::new(),
             HashMap::new(),
+            &HashMap::new(),
             &std::collections::HashSet::new(),
             None,
         );
@@ -1290,6 +2139,7 @@ mod tests {
             MarkdownOptions::default(),
             HashMap::new(),
             HashMap::new(),
+            &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
         );
@@ -1338,6 +2188,7 @@ mod tests {
             MarkdownOptions::default(),
             HashMap::new(),
             HashMap::new(),
+            &HashMap::new(),
             &std::collections::HashSet::new(),
             None,
         );
@@ -1354,6 +2205,338 @@ mod tests {
             heading_count <= 2,
             "Expected at most 2 headings but found {heading_count} in:\n{md}"
         );
+    }
+
+    #[test]
+    fn test_wrapped_bold_abstract_is_not_split_into_headings() {
+        // Regression for arXiv 1107.1353: the opening abstract paragraph is
+        // entirely bold at body size. The first wrapped lines used to become
+        // separate H2 headings, and the following body paragraph was joined to
+        // the bold abstract because the paragraph gap is modest.
+        let make = |text: &str, y: f32, font_size: f32, bold: bool| {
+            let mut item = make_item(text, 1, None);
+            item.y = y;
+            item.font_size = font_size;
+            item.height = font_size;
+            item.is_bold = bold;
+            item
+        };
+
+        let lines = vec![
+            make_line(vec![make(
+                "Quantum Nature of Light Measured With a Single Detector",
+                747.7,
+                25.0,
+                true,
+            )]),
+            make_line(vec![make(
+                "Gesine A. Steudle1*, Stefan Schietinger1, David Höckel1",
+                651.1,
+                11.0,
+                false,
+            )]),
+            make_line(vec![make(
+                "Zwiller2, and Oliver Benson1",
+                638.5,
+                11.0,
+                false,
+            )]),
+            make_line(vec![make(
+                "The introduction of light quanta by Einstein in 1905 triggered strong efforts to",
+                607.5,
+                11.0,
+                true,
+            )]),
+            make_line(vec![make(
+                "demonstrate the quantum properties of light directly, without involving matter",
+                594.8,
+                11.0,
+                true,
+            )]),
+            make_line(vec![make(
+                "quantization. It however took more than seven decades for the quantum granularity",
+                582.2,
+                11.0,
+                true,
+            )]),
+            make_line(vec![make(
+                "of light to be observed in the fluorescence of single atoms. Single atoms emit",
+                569.5,
+                11.0,
+                true,
+            )]),
+            make_line(vec![make(
+                "photons one at a time, this is typically demonstrated with a Hanbury-Brown-Twiss",
+                556.9,
+                11.0,
+                true,
+            )]),
+            make_line(vec![make(
+                "Our work significantly simplifies a widely used photon-correlation technique.",
+                544.2,
+                11.0,
+                true,
+            )]),
+            make_line(vec![make(
+                "A photon is a single excitation of a mode of the electromagnetic field.",
+                528.7,
+                11.0,
+                false,
+            )]),
+        ];
+
+        let md = to_markdown_from_lines_with_tables_and_images(
+            lines,
+            MarkdownOptions::default(),
+            HashMap::new(),
+            HashMap::new(),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+            None,
+        );
+
+        assert!(
+            md.contains("# Quantum Nature of Light Measured With a Single Detector"),
+            "title should remain a heading: {md}"
+        );
+        assert!(
+            !md.contains("## The introduction")
+                && !md.contains("## demonstrate")
+                && !md.contains("## quantization"),
+            "bold abstract lines should not become headings: {md}"
+        );
+        assert!(
+            md.contains("technique.**\n\nA photon is a single excitation"),
+            "body paragraph should be separated from bold abstract: {md}"
+        );
+    }
+
+    fn quoted_prose_fixture(first: &str, last: &str, size: f32, italic: bool) -> Vec<TextLine> {
+        let mut lines: Vec<_> = (0..10)
+            .map(|i| {
+                line_at(
+                    "Regular paragraph text provides the surrounding document context.",
+                    1,
+                    740.0 - i as f32 * 14.0,
+                )
+            })
+            .collect();
+        for (index, text) in [first, last].iter().enumerate() {
+            let mut item = make_item(text, 1, Some(index as i64));
+            item.y = 540.0 - index as f32 * 14.0;
+            item.font_size = size;
+            item.is_bold = true;
+            item.is_italic = italic;
+            lines.push(make_line(vec![item]));
+        }
+        lines.push(line_at(
+            "Ordinary body text follows the quotation.",
+            1,
+            480.0,
+        ));
+        lines
+    }
+
+    #[test]
+    fn quoted_bold_prose_stays_one_formatted_paragraph_in_both_renderers() {
+        let first =
+            "Every member keeps a careful record of each decision and its supporting evidence";
+        let last = "so that anyone can review the work and understand how the result was reached.";
+        for (open, close) in [('“', '”'), ('"', '"')] {
+            for size in [12.0, 13.0] {
+                for italic in [false, true] {
+                    let first = format!("{open}{first}");
+                    let last = format!("{last}{close}");
+                    let lines = quoted_prose_fixture(&first, &last, size, italic);
+                    let options = MarkdownOptions {
+                        base_font_size: Some(12.0),
+                        ..MarkdownOptions::default()
+                    };
+                    let outputs = [
+                        to_markdown_from_lines(lines.clone(), options.clone()),
+                        to_markdown_from_lines_with_tables_and_images(
+                            lines,
+                            options,
+                            HashMap::new(),
+                            HashMap::new(),
+                            &HashMap::new(),
+                            &HashSet::new(),
+                            None,
+                        ),
+                    ];
+                    for md in outputs {
+                        let paragraph = md
+                            .split("\n\n")
+                            .find(|p| p.contains("Every member"))
+                            .unwrap();
+                        let markers = if italic { "***" } else { "**" };
+                        assert!(
+                            paragraph.starts_with(&format!("{markers}{open}Every")),
+                            "{md}"
+                        );
+                        assert!(
+                            paragraph.ends_with(&format!("reached.{close}{markers}")),
+                            "{md}"
+                        );
+                        assert_eq!(
+                            paragraph
+                                .replace('*', "")
+                                .split_whitespace()
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                            format!("{first} {last}")
+                        );
+                        assert!(!paragraph.lines().any(|line| line.starts_with('#')), "{md}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_prose_suffixes_preserve_text_and_style_in_both_renderers() {
+        for (open, close) in [('“', '”'), ('"', '"')] {
+            for suffix in [
+                ".",
+                ",",
+                ";",
+                ":",
+                "!",
+                "?",
+                "…",
+                " [1]",
+                " [1, 2]",
+                " [1–3]",
+                " [1-3, 5]",
+                " (1)",
+                "¹",
+                "¹²",
+                "*",
+                "†",
+                "‡",
+                ". [1]†",
+                " [1].",
+            ] {
+                let first = format!(
+                    "{open}Every member keeps a careful record of each decision and its supporting evidence"
+                );
+                let last = format!(
+                    "so that anyone can review the work and understand how the result was reached{close}{suffix}"
+                );
+                let lines = quoted_prose_fixture(&first, &last, 13.0, true);
+                let options = MarkdownOptions {
+                    base_font_size: Some(12.0),
+                    ..MarkdownOptions::default()
+                };
+                let outputs = [
+                    to_markdown_from_lines(lines.clone(), options.clone()),
+                    to_markdown_from_lines_with_tables_and_images(
+                        lines,
+                        options,
+                        HashMap::new(),
+                        HashMap::new(),
+                        &HashMap::new(),
+                        &HashSet::new(),
+                        None,
+                    ),
+                ];
+                for md in outputs {
+                    let paragraph = md
+                        .split("\n\n")
+                        .find(|p| p.contains("Every member"))
+                        .unwrap();
+                    assert!(paragraph.starts_with(&format!("***{open}Every")), "{md}");
+                    assert!(paragraph.ends_with(&format!("{close}{suffix}***")), "{md}");
+                    assert_eq!(paragraph.replace("***", ""), format!("{first} {last}"));
+                    assert!(!paragraph.lines().any(|line| line.starts_with('#')), "{md}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_prose_suffixes_reject_prose_and_malformed_references() {
+        for suffix in [
+            " and another statement follows",
+            " 2024",
+            " (use this carefully)",
+            " (Smith, 2024)",
+            " [note]",
+            " []",
+            " [1,]",
+            " [1-]",
+            " [1,,2]",
+            " [1",
+            " (1, 2)",
+            " (1",
+            " [1] followed by prose",
+            " “Another title”",
+            " \"Another title\"",
+        ] {
+            assert!(!is_quote_suffix(suffix), "{suffix}");
+            let first =
+                "“Every member keeps a careful record of each decision and its supporting evidence";
+            let last = format!(
+                "so that anyone can review the work and understand how the result was reached.”{suffix}"
+            );
+            let lines = quoted_prose_fixture(first, &last, 13.0, true);
+            let (_, quoted) = find_wrapped_bold_paragraph_lines(&lines, 12.0, 20.0);
+            assert!(quoted.is_empty(), "{suffix}");
+        }
+    }
+
+    #[test]
+    fn quoted_prose_guard_keeps_quote_and_heading_boundaries() {
+        let first =
+            "“Every member keeps a careful record of each decision and its supporting evidence";
+        let last = "so that anyone can review the work and understand how the result was reached.”";
+        for (left, right, size) in [
+            ("“Collected Notes", "and Practical Examples”", 13.0),
+            (first, last, 16.0),
+            (first, "so that anyone can review the work and understand how the result was reached.", 13.0),
+            (first, "so that anyone can review the work and understand how the result was reached.\"", 13.0),
+            ("“Every Member Keeps a Careful Record of Each Decision and Its Supporting Evidence”", "“Readers Can Review the Work and Understand How the Final Result Was Reached”", 13.0),
+        ] {
+            let lines = quoted_prose_fixture(left, right, size, true);
+            let (_, quoted) = find_wrapped_bold_paragraph_lines(&lines, 12.0, 20.0);
+            assert!(quoted.is_empty(), "{left} / {right}");
+        }
+
+        let options = MarkdownOptions {
+            base_font_size: Some(12.0),
+            ..MarkdownOptions::default()
+        };
+        for lines in [
+            quoted_prose_fixture("“Collected Notes", "and Practical Examples”", 13.0, false),
+            quoted_prose_fixture(first, last, 16.0, true),
+        ] {
+            let md = to_markdown_from_lines_with_tables_and_images(
+                lines,
+                options.clone(),
+                HashMap::new(),
+                HashMap::new(),
+                &HashMap::new(),
+                &HashSet::new(),
+                None,
+            );
+            assert!(
+                md.lines()
+                    .any(|line| line.starts_with('#') && line.contains('“')),
+                "{md}"
+            );
+        }
+        let roles = HashMap::from([(1, HashMap::from([(0, StructRole::H2), (1, StructRole::H2)]))]);
+        let md = to_markdown_from_lines_with_tables_and_images(
+            quoted_prose_fixture(first, last, 13.0, true),
+            options,
+            HashMap::new(),
+            HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            Some(&roles),
+        );
+        assert!(md.contains("## “Every member"), "{md}");
+        assert!(md.contains("## so that anyone"), "{md}");
     }
 
     #[test]
@@ -1383,6 +2566,7 @@ mod tests {
             MarkdownOptions::default(),
             HashMap::new(),
             HashMap::new(),
+            &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
         );
@@ -1522,6 +2706,7 @@ mod tests {
             MarkdownOptions::default(),
             HashMap::new(),
             HashMap::new(),
+            &HashMap::new(),
             &std::collections::HashSet::new(),
             None,
         );
@@ -1537,6 +2722,158 @@ mod tests {
         assert!(
             md.contains("1. ") && md.contains("A model has CB-1"),
             "numbered list item should remain intact: {md}"
+        );
+    }
+
+    #[test]
+    fn extend_leader_respects_markup_breaks_and_sentences() {
+        let mut out = String::from("**Total assets....**\n");
+        assert!(extend_leader(&mut out, ". . ."));
+        assert_eq!(out, "**Total assets.......**\n");
+        // A paragraph line still waiting for its separator.
+        let mut out = String::from("Intro\n\nTotal assets....");
+        assert!(extend_leader(&mut out, ".."));
+        assert_eq!(out, "Intro\n\nTotal assets......");
+        // An ellipsis closing a sentence is not a leader.
+        let mut out = String::from("And then...\n");
+        assert!(!extend_leader(&mut out, "...."));
+        assert_eq!(out, "And then...\n");
+        // A spaced leader on the previous line is one too, but a period
+        // glued to the word followed by spaced dots is punctuation.
+        let mut out = String::from("Total assets . . . .\n");
+        assert!(extend_leader(&mut out, ". . ."));
+        assert_eq!(out, "Total assets . . . . . . .\n");
+        let mut out = String::from("Total assets . . . .\n");
+        assert!(extend_leader(&mut out, "..."));
+        assert_eq!(out, "Total assets . . . . . . .\n");
+        let mut out = String::from("Wait. . . .\n");
+        assert!(!extend_leader(&mut out, "...."));
+        assert_eq!(out, "Wait. . . .\n");
+        // A numeric label is a label; an underlined run of dots is not.
+        let mut out = String::from("12......\n");
+        assert!(extend_leader(&mut out, "...."));
+        assert_eq!(out, "12..........\n");
+        let mut out = String::from("<u>........</u>\n");
+        assert!(!extend_leader(&mut out, "...."));
+        assert_eq!(out, "<u>........</u>\n");
+        // Script markup is kept around the extended leader too.
+        let mut out = String::from("<sup>Note....</sup>\n");
+        assert!(extend_leader(&mut out, ".."));
+        assert_eq!(out, "<sup>Note......</sup>\n");
+        let mut out = String::from("<sub>Note....</sub>");
+        assert!(extend_leader(&mut out, ".."));
+        assert_eq!(out, "<sub>Note......</sub>");
+        let mut out = String::from("<u>Deficiency....</u>\n");
+        assert!(extend_leader(&mut out, "...."));
+        assert_eq!(out, "<u>Deficiency........</u>\n");
+        // A paragraph or page break in between: the dots belong to nothing.
+        let mut out = String::from("Total assets....\n\n");
+        assert!(!extend_leader(&mut out, "...."));
+        assert_eq!(out, "Total assets....\n\n");
+        // A sentence's period, a bare number, or dots alone are not leaders.
+        for prev in ["Introduction.\n", "............. 19.2\n", "........\n", ""] {
+            let mut out = String::from(prev);
+            assert!(!extend_leader(&mut out, "...."), "{prev:?}");
+            assert_eq!(out, prev);
+        }
+    }
+
+    #[test]
+    fn spaced_leader_tails_fold_in_the_line_style_and_collapse_cleanly() {
+        let lines = vec![
+            line_at(
+                "Balance of secured claims as per list \"B\" . . . . . .",
+                1,
+                700.0,
+            ),
+            line_at(". . . .", 1, 688.0),
+            line_at("Secured creditors as per list \"B\" . . . . . .", 1, 676.0),
+        ];
+        let md = to_markdown_from_lines(lines, MarkdownOptions::default());
+        assert!(
+            md.contains("Balance of secured claims as per list \"B\"..........\n"),
+            "{md}"
+        );
+        assert!(
+            !md.contains(". ....") && !md.contains(".. ."),
+            "no seam between spaced and solid dots:\n{md}"
+        );
+        assert!(
+            md.contains("Secured creditors as per list \"B\"......"),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn leader_continuation_lines_extend_the_line_before_them() {
+        let lines = vec![
+            line_at("Total assets........", 1, 700.0),
+            line_at("......", 1, 688.0),
+            line_at("Deficiency.......", 1, 676.0),
+            line_at("9. Real property as per list \"G\".....", 1, 664.0),
+            line_at("........", 1, 652.0),
+            line_at("10. Furniture.......", 1, 640.0),
+            // A value already closed this row: the dots are dropped.
+            line_at("Amount of subscribed capital....... 0,00", 1, 628.0),
+            line_at("....", 1, 616.0),
+            // Dots after a plain line, a dots-and-number table fragment, or
+            // more dots belong to nothing.
+            line_at("2 849,23", 1, 604.0),
+            line_at(".....................", 1, 592.0),
+            line_at("..........", 1, 580.0),
+            line_at("............. 19.2", 1, 568.0),
+            line_at("..........", 1, 556.0),
+            // A sentence's period is not a leader, and a lone ellipsis is text.
+            line_at("Introduction.", 1, 544.0),
+            line_at("......", 1, 532.0),
+            line_at("...", 1, 520.0),
+            line_at("Closing line", 1, 508.0),
+            // A run a paragraph-sized gap below a leader line is not its tail.
+            line_at("Far leader........", 1, 496.0),
+            line_at("......", 1, 296.0),
+        ];
+        let md = to_markdown_from_lines(lines, MarkdownOptions::default());
+        // Runs after a leader line are folded; runs after anything else keep
+        // their usual line of their own, as does a lone ellipsis.
+        let orphan_runs = md
+            .lines()
+            .filter(|l| {
+                let t = l.trim();
+                t.len() >= 4 && t.chars().all(|c| c == '.')
+            })
+            .count();
+        assert_eq!(orphan_runs, 6, "{md}");
+        assert!(md.contains("Far leader........\n"), "{md}");
+        assert!(
+            !md.contains("Far leader........."),
+            "no fold across a paragraph gap:\n{md}"
+        );
+        assert!(
+            md.contains("\n... Closing line") && !md.contains("Introduction...."),
+            "the ellipsis survives as text and is not folded into the sentence:\n{md}"
+        );
+        assert!(md.contains("Total assets.............."), "{md}");
+        assert!(md.contains("as per list \"G\"............."), "{md}");
+        assert!(md.contains("Deficiency......."), "{md}");
+        assert!(md.contains("capital....... 0,00"), "{md}");
+        assert!(
+            !md.contains("0,00."),
+            "a closed row takes no trailing dots:\n{md}"
+        );
+        assert!(md.contains("2 849,23"), "{md}");
+        assert!(
+            !md.contains("2 849,23."),
+            "dots are not glued to a plain line:\n{md}"
+        );
+        assert!(md.contains("............. 19.2"), "{md}");
+        assert!(
+            !md.contains("19.2."),
+            "a dots-and-number fragment takes none:\n{md}"
+        );
+        assert!(md.contains("Introduction."), "{md}");
+        assert!(
+            !md.contains("Introduction.."),
+            "a period is not a leader:\n{md}"
         );
     }
 }

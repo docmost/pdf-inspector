@@ -5,6 +5,8 @@ use napi_derive::napi;
 use std::collections::HashSet;
 use std::panic;
 
+mod images;
+
 // ---------------------------------------------------------------------------
 // Enums
 // ---------------------------------------------------------------------------
@@ -27,30 +29,45 @@ pub enum ItemType {
     FormField,
 }
 
-/// Image format for extracted images.
+/// Where `TextItem.isBold` came from. When more than one of them says bold
+/// the first in this order is reported.
 #[napi(string_enum)]
-pub enum ImageFormat {
-    Jpeg,
-    Png,
+#[derive(Clone, Copy)]
+pub enum BoldSource {
+    /// A bold word or foundry style abbreviation in the font name ("Bold",
+    /// "-Bd", "Black", "Demi", "-Hv", "W7").
+    FontName,
+    /// The FontDescriptor's ForceBold flag, or the embedded font program's
+    /// own bold selection.
+    FontFlags,
+    /// The weight class: `fontWeight` at or above `boldWeightThreshold`
+    /// (only with `boldFromWeight`).
+    WeightClass,
+    /// Text filled and stroked to look heavier, in a face that is not bold
+    /// itself.
+    Painted,
 }
 
-/// An image extracted from a PDF.
-#[napi(object)]
-pub struct ExtractedImage {
-    /// Page number (1-indexed).
-    pub page: u32,
-    /// X position on page.
-    pub x: f64,
-    /// Y position on page.
-    pub y: f64,
-    /// Pixel width.
-    pub width: u32,
-    /// Pixel height.
-    pub height: u32,
-    /// Image format.
-    pub format: ImageFormat,
-    /// Raw image bytes.
-    pub data: Buffer,
+/// Selects when OCR runs.
+#[napi(string_enum)]
+#[cfg(feature = "ocr")]
+#[derive(Clone, Copy)]
+pub enum OcrMode {
+    /// Never run OCR; return the native extraction in the OCR result shape.
+    Off,
+    /// Run OCR only on pages selected by the native quality signals.
+    Auto,
+    /// Run OCR on every selected page.
+    Force,
+}
+
+/// How final page content was sourced.
+#[napi(string_enum)]
+#[cfg(feature = "ocr")]
+pub enum PageContentSource {
+    Native,
+    Ocr,
+    Fused,
 }
 
 // ---------------------------------------------------------------------------
@@ -66,33 +83,64 @@ pub struct PdfResult {
     pub processing_time_ms: u32,
     /// 1-indexed page numbers that need OCR.
     pub pages_needing_ocr: Vec<u32>,
+    /// Machine-readable OCR reasons by 1-indexed page.
+    pub ocr_reasons_by_page: Vec<PageOcrReasons>,
+    /// The `/Title` of the document information dictionary, decoded as a PDF
+    /// text string (UTF-16 or UTF-8 after a byte order mark, PDFDocEncoding
+    /// otherwise). Omitted when the entry is missing or not a string. The
+    /// entries below follow the same decoding and missing-value rule.
     pub title: Option<String>,
+    /// The document information dictionary's `/Author`.
+    pub author: Option<String>,
+    /// The document information dictionary's `/Subject`.
+    pub subject: Option<String>,
+    /// The document information dictionary's `/Keywords`.
+    pub keywords: Option<String>,
+    /// The document information dictionary's `/Creator`: the application the
+    /// document was authored in.
+    pub creator: Option<String>,
+    /// The document information dictionary's `/Producer`: the application
+    /// that wrote the PDF.
+    pub producer: Option<String>,
+    /// The document information dictionary's `/CreationDate` as written, a
+    /// PDF date string such as `D:20240115103000+01'00'`.
+    pub creation_date: Option<String>,
+    /// The document information dictionary's `/ModDate` as written.
+    pub mod_date: Option<String>,
     pub confidence: f64,
     pub is_complex_layout: bool,
     pub pages_with_tables: Vec<u32>,
     pub pages_with_columns: Vec<u32>,
     pub has_encoding_issues: bool,
+    /// Fonts whose ToUnicode CMap — or, for a font without one, the embedded
+    /// program's cmap table — lacked an entry for a code the document shows
+    /// through it, with the counts of codes shown, read from their neighbours
+    /// and left as U+FFFD. Always empty for `detectPdf`, which decodes no
+    /// text; otherwise empty when every such code had an entry.
+    pub cmap_gaps: Vec<FontCmapGaps>,
 }
 
-/// Full PDF processing result with markdown, metadata, and extracted images.
-///
-/// The markdown contains `![image](pdf-image://N)` placeholders where N
-/// is the index into the `images` array.
+/// OCR reasons for a single 1-indexed page.
 #[napi(object)]
-pub struct PdfResultWithImages {
-    pub pdf_type: PdfType,
-    pub markdown: Option<String>,
-    pub page_count: u32,
-    pub processing_time_ms: u32,
-    pub pages_needing_ocr: Vec<u32>,
-    pub title: Option<String>,
-    pub confidence: f64,
-    pub is_complex_layout: bool,
-    pub pages_with_tables: Vec<u32>,
-    pub pages_with_columns: Vec<u32>,
-    pub has_encoding_issues: bool,
-    /// Extracted images. Indices match `pdf-image://N` placeholders in markdown.
-    pub images: Vec<ExtractedImage>,
+pub struct PageOcrReasons {
+    pub page: u32,
+    pub reasons: Vec<String>,
+}
+
+/// A font whose ToUnicode CMap — or, for a font without one, the embedded
+/// program's cmap table — had no entry for some of the codes the document
+/// shows through it, and what became of those codes.
+#[napi(object)]
+pub struct FontCmapGaps {
+    /// The font's /BaseFont name, or its resource name when it has none.
+    pub font: String,
+    /// Codes shown through the font's CMap, repeats included: two-byte codes,
+    /// or the bytes of a single-byte CMap.
+    pub codes: u32,
+    /// Codes without an entry that were read from the mapped codes around them.
+    pub interpolated: u32,
+    /// Codes without an entry that could not be read; each is a U+FFFD in the text.
+    pub unmapped: u32,
 }
 
 /// Lightweight PDF classification result.
@@ -106,29 +154,189 @@ pub struct PdfClassification {
 }
 
 /// A positioned text item extracted from a PDF.
+///
+/// `x`/`y` are PDF points relative to the page's **visible page box**
+/// (`CropBox ∩ MediaBox`, else the MediaBox; a CropBox that does not overlap
+/// the MediaBox is ignored, and a page without a MediaBox is measured against
+/// US Letter), origin at the box's lower-left corner with `y` growing upward.
+/// [`extractTextInRegions`] reads its regions relative to the same box but
+/// from its top-left corner with `y` growing downward; flip with the box
+/// height. `/Rotate` is not applied.
+///
+/// On a page whose text is predominantly rotated the extractor turns the
+/// coordinate frame so that text reads left-to-right, and the shift into the
+/// visible page box is turned the same way; items on such a page are
+/// expressed in that turned frame. Use
+/// [`extract_text_with_positions_and_rotations`] (`extractTextWithPositionsAndRotations`
+/// in JavaScript) to learn which pages were turned and which way.
+///
+/// Pass `{ frame: "display" }` (see [`FrameOptions`]) to get every item in
+/// the rendered page's frame instead: the visible page box turned clockwise
+/// by the page's inheritable `/Rotate`, with the turn of a rotated page
+/// undone, so `x`/`y`/`width`/`height` and `rotation` describe the item as
+/// a renderer draws it.
 #[napi(object)]
 pub struct TextItem {
     pub text: String,
+    /// Left edge, in PDF points from the visible page box's left edge.
     pub x: f64,
+    /// Baseline for text (rect bottom edge for image, link and form-field
+    /// items), in PDF points from the visible page box's bottom edge.
     pub y: f64,
     pub width: f64,
     pub height: f64,
+    /// Rotation of the run's baseline in degrees counter-clockwise from the
+    /// page's x axis, in `[0, 360)`: `0` for ordinary horizontal text, `90`
+    /// for text reading bottom-to-top (a rotated margin stamp), `270` for
+    /// top-to-bottom, `180` for upside-down. `x`/`y`/`width`/`height` is the
+    /// run's axis-aligned box, so a vertical run is tall and thin (height
+    /// ≫ width) instead of zero-width.
+    pub rotation: f64,
+    /// Whether the run's advance came from font metrics. `false` when the
+    /// font carries no width information (or an ActualText span's advance
+    /// could not be recovered): the box's extent along the baseline is then
+    /// an estimate of half an em per painted glyph (an ActualText span counts
+    /// the glyphs it covers, not its replacement text), not a measurement.
+    pub advance_known: bool,
     pub font: String,
+    pub font_tag: String,
+    /// Present only when legacy private-use symbol cleanup changed a source
+    /// character. This is decoding provenance, not a request to run OCR.
+    /// Merged items retain evidence from all contributing runs.
+    pub legacy_symbol_rewrite: Option<bool>,
     pub font_size: f64,
     pub page: u32,
+    /// Bold from the font name, the FontDescriptor's ForceBold flag, the
+    /// embedded program's bold selection, or text filled and stroked to
+    /// look heavier. With `{ boldFromWeight: true }` (see [`FrameOptions`])
+    /// also `true` when `fontWeight` is `boldWeightThreshold` (600 by
+    /// default) or more. `boldSource` says which.
     pub is_bold: bool,
     pub is_italic: bool,
+    /// The font's weight class on the 100..900 scale shared by CSS
+    /// `font-weight` and the OS/2 `usWeightClass` field (400 regular, 700
+    /// bold): the embedded font program's OS/2 table, else the
+    /// FontDescriptor's `/FontWeight`, else a weight word in the font name
+    /// ("Light", "Medium", "-Md", "Black", "W6"). Omitted when none of them
+    /// says, and for image, link and form-field items. Independent of
+    /// `isBold`, which is unchanged: a medium face reports `500` with
+    /// `isBold: false`.
+    pub font_weight: Option<u32>,
+    /// Where `isBold` came from — `"FontName"`, `"FontFlags"`,
+    /// `"WeightClass"` (with `boldFromWeight`) or `"Painted"`, the first of
+    /// them in that order when more than one says bold — so a verdict can be
+    /// weighed against `fontWeight`: a face whose name says Bold over a
+    /// weight class of 400 reports `"FontName"`. Omitted when `isBold` is
+    /// `false`, and for image, link and form-field items.
+    pub bold_source: Option<BoldSource>,
+    /// Whether the font is fixed-pitch (monospaced): `true` when the
+    /// FontDescriptor's FixedPitch flag or the embedded program's `post`
+    /// table says so, else measured from the font's width table — `true`
+    /// when a dozen or more of its glyphs share one advance, `false` when
+    /// two differ. Omitted when the font declares nothing and no two
+    /// advances differ but fewer than a dozen share one, and for image,
+    /// link and form-field items.
+    /// Many producers write `/Flags 4` whatever the face, so the flag is
+    /// only ever read as a yes.
+    pub fixed_pitch: Option<bool>,
+    /// The fill colour the run was shown with, as sRGB `[red, green, blue]`
+    /// of 0..255: what its glyphs are filled with in the render modes that
+    /// fill (0, 2, 4, 6). DeviceRGB is read as sRGB, DeviceGray as three
+    /// equal components and DeviceCMYK converted as the PDF specification
+    /// converts it to DeviceRGB; ICCBased spaces are read by their component
+    /// count and Indexed spaces through their palette. Omitted for any other
+    /// colour space (Separation, DeviceN, Pattern, CalRGB, Lab, ...), and for
+    /// image, link and form-field items. A merged item keeps its first run's.
+    #[napi(ts_type = "[number, number, number]")]
+    pub fill_color: Option<Vec<u32>>,
+    /// The stroke colour the run was shown with, read like `fillColor`: what
+    /// its glyph outlines are stroked with in the render modes that stroke
+    /// (1, 2, 5, 6).
+    #[napi(ts_type = "[number, number, number]")]
+    pub stroke_color: Option<Vec<u32>>,
+    /// The text render mode (`Tr`) the run was shown with, 0..7: 0 fill, 1
+    /// stroke, 2 fill and stroke, 3 invisible (the mode of OCR text layers),
+    /// 4..6 as 0..2 and clip, 7 clip only. Runs in modes 3 and 7 put no
+    /// glyphs on the page. The mode holds across text objects, is saved and
+    /// restored by `q`/`Q` and is inherited by Form XObjects. Which runs are
+    /// extracted is unchanged by it. Omitted for image, link and form-field
+    /// items.
+    pub render_mode: Option<u32>,
+    /// Underline detected geometrically (drawn rule/thin rect under the
+    /// baseline) — PDFs carry no underline font flag.
+    pub is_underline: bool,
+    /// Strikeout detected geometrically (rule crossing the glyphs at mid
+    /// x-height).
+    pub is_strikeout: bool,
+    /// Signed baseline offset (PDF points, y-up) of a super/subscript glyph
+    /// run from the body baseline it is attached to; `0` for normal text.
+    /// Positive = raised (superscript: footnote/affiliation markers,
+    /// exponents), negative = lowered (subscript). Emit `<sup>`/`<sub>` from
+    /// the sign. Digit-only markers beside a word are already fused into it
+    /// as Unicode super/subscript characters ("word²") and carry `0`.
+    pub baseline_shift: f64,
     pub item_type: ItemType,
     /// URL for link items, `None` for other types.
     pub link_url: Option<String>,
+    /// Marked Content ID from the content stream's BDC/BMC operator, `None`
+    /// when the text is not part of marked content. Join with the
+    /// `page`/`mcid` pairs from [`extractStructureElements`] to attach
+    /// structure-tree roles (headings, paragraphs, …) in tagged PDFs.
+    pub mcid: Option<i64>,
 }
 
 /// A page's regions for text extraction: (page_index_0based, bboxes).
 #[napi(object)]
 pub struct PageRegions {
     pub page: u32,
-    /// Each bbox is [x1, y1, x2, y2] in PDF points, top-left origin.
+    /// Each bbox is [x1, y1, x2, y2] in PDF points, top-left origin of the
+    /// visible page box (`CropBox ∩ MediaBox`, else the MediaBox). By
+    /// default the box is read as laid out in the content stream with
+    /// `/Rotate` not applied — the frame `extractTextWithPositions` reports
+    /// items in, flipped to a top-left origin — which matches a rendered
+    /// page image only for pages with `/Rotate 0` whose text is not
+    /// predominantly rotated (such a page is turned so its text reads
+    /// left-to-right, see [`TextItem`]). With
+    /// `{ frame: "display" }` (see [`FrameOptions`]) the bbox is read on the
+    /// rendered page: the visible box turned clockwise by the page's
+    /// inheritable `/Rotate`, top-left origin, `y` down.
     pub regions: Vec<Vec<f64>>,
+}
+
+/// Options shared by `extractTextWithPositions`,
+/// `extractTextWithPositionsAndRotations`, `extractTextInRegions` and
+/// `extractTablesInRegions`: the coordinate frame, and whether (and from
+/// which weight class) bold is also read from the font's weight class.
+#[napi(object)]
+#[derive(Clone, Default)]
+pub struct FrameOptions {
+    /// `"sheet"` (default): the visible page box as laid out in the content
+    /// stream, `/Rotate` not applied; pages whose text is predominantly
+    /// rotated are turned so that text reads left-to-right (see
+    /// [`TextItem`]). `"display"`: the rendered page — the visible page box
+    /// turned clockwise by the page's inheritable `/Rotate`, lower-left
+    /// origin and `y` up for items, top-left origin and `y` down for region
+    /// bboxes — with the turn of a rotated page undone, so items sit where a
+    /// renderer draws them and region bboxes can be taken from a rendered
+    /// page image.
+    #[napi(ts_type = "\"sheet\" | \"display\"")]
+    pub frame: Option<String>,
+    /// Also read bold from the font's weight class. When `true`,
+    /// `TextItem.isBold` is also `true` for items whose `fontWeight` is
+    /// `boldWeightThreshold` (600, SemiBold, by default) or more — with
+    /// `boldSource: "WeightClass"` unless the font's name or flags already
+    /// said bold — and adjacent runs are merged by that
+    /// verdict: a run the weight makes bold stays apart from its plain
+    /// neighbours, so a heavier run inside a lighter paragraph keeps its own
+    /// item, while runs whose weights differ but agree on bold merge as
+    /// usual. `false` by default: `isBold` and item merging are then
+    /// unchanged, and `fontWeight` is reported either way.
+    pub bold_from_weight: Option<bool>,
+    /// The weight class from which `boldFromWeight` reads bold, on the
+    /// 100..900 scale: 600 by default, so SemiBold and heavier faces are
+    /// bold. It matters only when `boldFromWeight` is `true`, but a value
+    /// outside 100..900 is an argument error either way.
+    pub bold_weight_threshold: Option<u32>,
 }
 
 /// Extracted text for a single region.
@@ -137,6 +345,8 @@ pub struct RegionText {
     pub text: String,
     /// `true` when the text should not be trusted (empty, GID fonts, garbage, encoding issues).
     pub needs_ocr: bool,
+    /// Machine-readable OCR reason when the cause is known.
+    pub ocr_reason: Option<String>,
 }
 
 /// Extracted text for one page's regions.
@@ -151,6 +361,90 @@ pub struct PageRegionTexts {
 pub struct VectorGridDetectionJs {
     pub structure_tokens: Vec<String>,
     pub cell_bboxes: Vec<Vec<f64>>,
+}
+
+/// Options for one-call native extraction with selective OCR.
+#[napi(object)]
+#[cfg(feature = "ocr")]
+#[derive(Clone)]
+pub struct OcrOptions {
+    /// OCR routing behavior. Defaults to Auto.
+    pub mode: Option<OcrMode>,
+    /// Optional 1-indexed page selection.
+    pub page_numbers: Option<Vec<u32>>,
+    /// Password for an encrypted PDF.
+    pub password: Option<String>,
+    /// Page rasterization resolution. Defaults to 150 DPI.
+    pub dpi: Option<f64>,
+    /// Drop OCR spans below this inclusive 0-1 threshold.
+    pub minimum_confidence: Option<f64>,
+    /// Recommend hosted parsing below this inclusive 0-1 page confidence.
+    pub hosted_recommendation_confidence: Option<f64>,
+    /// Directory containing an offline OCR model set.
+    pub model_directory: Option<String>,
+    /// Disable model downloads and require a model directory or warm cache.
+    pub offline: Option<bool>,
+}
+
+/// Exact OCR model identity retained in page provenance.
+#[napi(object)]
+#[cfg(feature = "ocr")]
+pub struct OcrModelIdentity {
+    pub name: String,
+    pub revision: String,
+}
+
+/// Per-page OCR processing timings.
+#[napi(object)]
+#[cfg(feature = "ocr")]
+pub struct OcrTimings {
+    pub render_ms: u32,
+    pub ocr_ms: u32,
+    pub assembly_ms: u32,
+}
+
+/// Source, model, confidence, and fallback metadata for one page.
+#[napi(object)]
+#[cfg(feature = "ocr")]
+pub struct OcrPageProvenance {
+    /// 1-indexed page number.
+    pub page_number: u32,
+    pub source: PageContentSource,
+    pub ocr_model: Option<OcrModelIdentity>,
+    pub render_dpi: Option<f64>,
+    pub ocr_confidence: Option<f64>,
+    pub timings: OcrTimings,
+    pub warnings: Vec<String>,
+    pub hosted_recommended: bool,
+}
+
+/// Final Markdown and provenance for one page.
+#[napi(object)]
+#[cfg(feature = "ocr")]
+pub struct OcrPageResult {
+    /// 1-indexed page number.
+    pub page_number: u32,
+    pub markdown: String,
+    pub provenance: OcrPageProvenance,
+}
+
+/// Complete native/OCR Markdown output.
+#[napi(object)]
+#[cfg(feature = "ocr")]
+pub struct OcrPdfResult {
+    pub markdown: String,
+    pub pages: Vec<OcrPageResult>,
+    pub page_count: u32,
+    pub pages_recommended_for_ocr: Vec<u32>,
+    pub pages_routed_to_ocr: Vec<u32>,
+    pub pages_recommending_hosted: Vec<u32>,
+    pub ocr_reasons_by_page: Vec<PageOcrReasons>,
+    pub pages_with_tables: Vec<u32>,
+    pub pages_with_columns: Vec<u32>,
+    pub is_complex: bool,
+    pub processing_time_ms: u32,
+    pub render_time_ms: u32,
+    pub ocr_time_ms: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -173,12 +467,152 @@ fn to_napi_result(r: pdf_inspector::PdfProcessResult) -> PdfResult {
         page_count: r.page_count,
         processing_time_ms: r.processing_time_ms as u32,
         pages_needing_ocr: r.pages_needing_ocr,
+        ocr_reasons_by_page: to_napi_page_ocr_reasons(r.ocr_reasons_by_page),
         title: r.title,
+        author: r.author,
+        subject: r.subject,
+        keywords: r.keywords,
+        creator: r.creator,
+        producer: r.producer,
+        creation_date: r.creation_date,
+        mod_date: r.mod_date,
         confidence: r.confidence as f64,
         is_complex_layout: r.layout.is_complex,
         pages_with_tables: r.layout.pages_with_tables,
         pages_with_columns: r.layout.pages_with_columns,
         has_encoding_issues: r.has_encoding_issues,
+        cmap_gaps: to_napi_font_cmap_gaps(r.cmap_gaps),
+    }
+}
+
+fn to_napi_font_cmap_gaps(gaps: Vec<pdf_inspector::FontCMapGaps>) -> Vec<FontCmapGaps> {
+    gaps.into_iter()
+        .map(|gap| FontCmapGaps {
+            font: gap.font,
+            codes: gap.codes,
+            interpolated: gap.interpolated,
+            unmapped: gap.unmapped,
+        })
+        .collect()
+}
+
+fn to_napi_page_ocr_reasons(reasons: Vec<pdf_inspector::PageOcrReasons>) -> Vec<PageOcrReasons> {
+    reasons
+        .into_iter()
+        .map(|reason| PageOcrReasons {
+            page: reason.page,
+            reasons: reason.reasons,
+        })
+        .collect()
+}
+
+#[cfg(feature = "ocr")]
+fn to_core_ocr_options(options: Option<OcrOptions>) -> pdf_inspector::vision::OcrPdfOptions {
+    let mut result = pdf_inspector::vision::OcrPdfOptions::auto();
+    let Some(options) = options else {
+        return result;
+    };
+
+    if let Some(mode) = options.mode {
+        result.ocr.mode = match mode {
+            OcrMode::Off => pdf_inspector::vision::OcrMode::Off,
+            OcrMode::Auto => pdf_inspector::vision::OcrMode::Auto,
+            OcrMode::Force => pdf_inspector::vision::OcrMode::Force,
+        };
+    }
+    if let Some(pages) = options.page_numbers {
+        result = result.page_numbers(pages);
+    }
+    if let Some(password) = options.password {
+        result = result.password(password);
+    }
+    if let Some(dpi) = options.dpi {
+        result.render.dpi = dpi as f32;
+    }
+    if let Some(minimum_confidence) = options.minimum_confidence {
+        result.ocr.minimum_confidence = minimum_confidence as f32;
+    }
+    if let Some(confidence) = options.hosted_recommendation_confidence {
+        result.hosted_recommendation_confidence = confidence as f32;
+    }
+    if let Some(directory) = options.model_directory {
+        result.ocr.model_directory = Some(directory.into());
+    }
+    if options.offline.unwrap_or(false) {
+        result.ocr.model_downloads = pdf_inspector::vision::ModelDownloadPolicy::Offline;
+    }
+    result
+}
+
+#[cfg(feature = "ocr")]
+fn convert_page_content_source(
+    source: pdf_inspector::vision::PageContentSource,
+) -> PageContentSource {
+    match source {
+        pdf_inspector::vision::PageContentSource::Native => PageContentSource::Native,
+        pdf_inspector::vision::PageContentSource::Ocr => PageContentSource::Ocr,
+        pdf_inspector::vision::PageContentSource::Fused => PageContentSource::Fused,
+        _ => PageContentSource::Native,
+    }
+}
+
+#[cfg(feature = "ocr")]
+fn timing_ms(value: u64) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+#[cfg(feature = "ocr")]
+fn to_napi_ocr_result(result: pdf_inspector::vision::OcrPdfResult) -> OcrPdfResult {
+    OcrPdfResult {
+        markdown: result.markdown,
+        pages: result
+            .pages
+            .into_iter()
+            .map(|page| {
+                let provenance = page.provenance;
+                OcrPageResult {
+                    page_number: page.page_number,
+                    markdown: page.markdown,
+                    provenance: OcrPageProvenance {
+                        page_number: provenance.page_number,
+                        source: convert_page_content_source(provenance.source),
+                        ocr_model: provenance.ocr_model.map(|model| OcrModelIdentity {
+                            name: model.name,
+                            revision: model.revision,
+                        }),
+                        render_dpi: provenance.render_dpi.map(f64::from),
+                        ocr_confidence: provenance.ocr_confidence.map(f64::from),
+                        timings: OcrTimings {
+                            render_ms: timing_ms(provenance.timings.render_ms),
+                            ocr_ms: timing_ms(provenance.timings.ocr_ms),
+                            assembly_ms: timing_ms(provenance.timings.assembly_ms),
+                        },
+                        warnings: provenance.warnings,
+                        hosted_recommended: provenance.hosted_recommended,
+                    },
+                }
+            })
+            .collect(),
+        page_count: result.page_count,
+        pages_recommended_for_ocr: result.pages_recommended_for_ocr,
+        pages_routed_to_ocr: result.pages_routed_to_ocr,
+        pages_recommending_hosted: result.pages_recommending_hosted,
+        ocr_reasons_by_page: to_napi_page_ocr_reasons(result.ocr_reasons_by_page),
+        pages_with_tables: result.pages_with_tables,
+        pages_with_columns: result.pages_with_columns,
+        is_complex: result.is_complex,
+        processing_time_ms: timing_ms(result.processing_time_ms),
+        render_time_ms: timing_ms(result.render_time_ms),
+        ocr_time_ms: timing_ms(result.ocr_time_ms),
+    }
+}
+
+fn convert_bold_source(source: pdf_inspector::BoldSource) -> BoldSource {
+    match source {
+        pdf_inspector::BoldSource::FontName => BoldSource::FontName,
+        pdf_inspector::BoldSource::FontFlags => BoldSource::FontFlags,
+        pdf_inspector::BoldSource::WeightClass => BoldSource::WeightClass,
+        pdf_inspector::BoldSource::Painted => BoldSource::Painted,
     }
 }
 
@@ -193,6 +627,38 @@ fn convert_item_type(t: &pdf_inspector::types::ItemType) -> (ItemType, Option<St
 
 fn to_napi_err(e: impl std::fmt::Display, ctx: &str) -> Error {
     Error::new(Status::GenericFailure, format!("{ctx}: {e}"))
+}
+
+/// The options an optional `FrameOptions` asks for; an unknown frame is an
+/// argument error rather than a silent fallback to the default.
+fn position_options(
+    options: Option<&FrameOptions>,
+    ctx: &str,
+) -> Result<pdf_inspector::PositionOptions> {
+    let frame = match options.and_then(|options| options.frame.as_deref()) {
+        None | Some("sheet") => pdf_inspector::PositionFrame::Sheet,
+        Some("display") => pdf_inspector::PositionFrame::Display,
+        Some(other) => {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!("{ctx}: unknown frame {other:?}; expected \"sheet\" or \"display\""),
+            ))
+        }
+    };
+    let bold_from_weight = options.is_some_and(|options| options.bold_from_weight == Some(true));
+    let mut position = pdf_inspector::PositionOptions::new()
+        .frame(frame)
+        .bold_from_weight(bold_from_weight);
+    if let Some(threshold) = options.and_then(|options| options.bold_weight_threshold) {
+        if !(100..=900).contains(&threshold) {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!("{ctx}: boldWeightThreshold {threshold} is outside 100..900"),
+            ));
+        }
+        position = position.bold_weight_threshold(threshold as u16);
+    }
+    Ok(position)
 }
 
 /// Run a closure, catching any Rust panic and converting it to a NAPI error.
@@ -220,6 +686,39 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Shared implementations (single body behind sync and async entry points)
+// ---------------------------------------------------------------------------
+
+fn process_pdf_impl(bytes: &[u8], pages: Option<Vec<u32>>) -> Result<PdfResult> {
+    let mut opts = pdf_inspector::PdfOptions::new();
+    if let Some(p) = pages {
+        opts = opts.pages(p);
+    }
+    let result = pdf_inspector::process_pdf_mem_with_options(bytes, opts)
+        .map_err(|e| to_napi_err(e, "process_pdf"))?;
+    Ok(to_napi_result(result))
+}
+
+#[cfg(feature = "ocr")]
+fn process_pdf_with_ocr_impl(bytes: &[u8], options: Option<OcrOptions>) -> Result<OcrPdfResult> {
+    let options = to_core_ocr_options(options);
+    let result = pdf_inspector::vision::process_pdf_with_ocr_mem(bytes, options)
+        .map_err(|error| to_napi_err(error, "process_pdf_with_ocr"))?;
+    Ok(to_napi_ocr_result(result))
+}
+
+fn classify_pdf_impl(bytes: &[u8]) -> Result<PdfClassification> {
+    let result =
+        pdf_inspector::classify_pdf_mem(bytes).map_err(|e| to_napi_err(e, "classify_pdf"))?;
+    Ok(PdfClassification {
+        pdf_type: convert_pdf_type(result.pdf_type),
+        page_count: result.page_count,
+        pages_needing_ocr: result.pages_needing_ocr,
+        confidence: result.confidence as f64,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Public NAPI API
 // ---------------------------------------------------------------------------
 
@@ -227,62 +726,7 @@ where
 #[napi]
 pub fn process_pdf(buffer: Buffer, pages: Option<Vec<u32>>) -> Result<PdfResult> {
     let bytes: Vec<u8> = buffer.to_vec();
-    catch_panic("process_pdf", move || {
-        let mut opts = pdf_inspector::PdfOptions::new();
-        if let Some(p) = pages {
-            opts = opts.pages(p);
-        }
-        let result = pdf_inspector::process_pdf_mem_with_options(&bytes, opts)
-            .map_err(|e| to_napi_err(e, "process_pdf"))?;
-        Ok(to_napi_result(result))
-    })
-}
-
-/// Process a PDF and extract both markdown and images.
-///
-/// The markdown contains `![image](pdf-image://N)` placeholders where N is the
-/// index into the returned `images` array.
-#[napi]
-pub fn process_pdf_with_images(
-    buffer: Buffer,
-    pages: Option<Vec<u32>>,
-) -> Result<PdfResultWithImages> {
-    let bytes: Vec<u8> = buffer.to_vec();
-    catch_panic("process_pdf_with_images", move || {
-        let mut opts = pdf_inspector::PdfOptions::new().extract_images(true);
-        if let Some(p) = pages {
-            opts = opts.pages(p);
-        }
-        let result = pdf_inspector::process_pdf_mem_with_options(&bytes, opts)
-            .map_err(|e| to_napi_err(e, "process_pdf_with_images"))?;
-        let images: Vec<ExtractedImage> = result
-            .images
-            .iter()
-            .map(|img| ExtractedImage {
-                page: img.page,
-                x: img.x as f64,
-                y: img.y as f64,
-                width: img.width,
-                height: img.height,
-                format: convert_image_format(&img.format),
-                data: img.data.clone().into(),
-            })
-            .collect();
-        Ok(PdfResultWithImages {
-            pdf_type: convert_pdf_type(result.pdf_type),
-            markdown: result.markdown,
-            page_count: result.page_count,
-            processing_time_ms: result.processing_time_ms as u32,
-            pages_needing_ocr: result.pages_needing_ocr,
-            title: result.title,
-            confidence: result.confidence as f64,
-            is_complex_layout: result.layout.is_complex,
-            pages_with_tables: result.layout.pages_with_tables,
-            pages_with_columns: result.layout.pages_with_columns,
-            has_encoding_issues: result.has_encoding_issues,
-            images,
-        })
-    })
+    catch_panic("process_pdf", move || process_pdf_impl(&bytes, pages))
 }
 
 /// Fast detection only — no text extraction or markdown.
@@ -302,16 +746,7 @@ pub fn detect_pdf(buffer: Buffer) -> Result<PdfResult> {
 #[napi]
 pub fn classify_pdf(buffer: Buffer) -> Result<PdfClassification> {
     let bytes: Vec<u8> = buffer.to_vec();
-    catch_panic("classify_pdf", move || {
-        let result =
-            pdf_inspector::classify_pdf_mem(&bytes).map_err(|e| to_napi_err(e, "classify_pdf"))?;
-        Ok(PdfClassification {
-            pdf_type: convert_pdf_type(result.pdf_type),
-            page_count: result.page_count,
-            pages_needing_ocr: result.pages_needing_ocr,
-            confidence: result.confidence as f64,
-        })
-    })
+    catch_panic("classify_pdf", move || classify_pdf_impl(&bytes))
 }
 
 /// Extract plain text from a PDF Buffer.
@@ -325,44 +760,242 @@ pub fn extract_text(buffer: Buffer) -> Result<String> {
 }
 
 /// Extract text with position information from a PDF Buffer.
+///
+/// Items are reported in PDF points relative to the page's visible page box
+/// (`CropBox ∩ MediaBox`, else the MediaBox) with the box's lower-left
+/// corner as origin — see [`TextItem`]. `pages` is 1-indexed (matching
+/// `TextItem.page`); omit it for the whole document. `options.frame`
+/// selects the coordinate frame (see [`FrameOptions`]): `"sheet"` by
+/// default, `"display"` for the rendered page's frame.
 #[napi]
 pub fn extract_text_with_positions(
     buffer: Buffer,
     pages: Option<Vec<u32>>,
+    options: Option<FrameOptions>,
 ) -> Result<Vec<TextItem>> {
     let bytes: Vec<u8> = buffer.to_vec();
+    let position = position_options(options.as_ref(), "extract_text_with_positions")?;
     catch_panic("extract_text_with_positions", move || {
-        let items = match pages {
-            Some(p) => {
-                let page_set: HashSet<u32> = p.into_iter().collect();
-                pdf_inspector::extractor::extract_text_with_positions_mem_pages(
-                    &bytes,
-                    Some(&page_set),
-                )
-                .map_err(|e| to_napi_err(e, "extract_text_with_positions"))?
-            }
-            None => pdf_inspector::extractor::extract_text_with_positions_mem(&bytes)
-                .map_err(|e| to_napi_err(e, "extract_text_with_positions"))?,
-        };
+        extract_text_with_positions_impl(&bytes, pages, position)
+    })
+}
 
-        Ok(items
+fn extract_text_with_positions_impl(
+    bytes: &[u8],
+    pages: Option<Vec<u32>>,
+    position: pdf_inspector::PositionOptions,
+) -> Result<Vec<TextItem>> {
+    let page_set: Option<HashSet<u32>> = pages.map(|p| p.into_iter().collect());
+    let items = pdf_inspector::extract_text_with_positions_mem_with_options(
+        bytes,
+        page_set.as_ref(),
+        position,
+    )
+    .map_err(|e| to_napi_err(e, "extract_text_with_positions"))?;
+
+    Ok(items.into_iter().map(convert_text_item).collect())
+}
+
+pub struct ExtractTextWithPositionsTask {
+    bytes: Vec<u8>,
+    pages: Option<Vec<u32>>,
+    position: pdf_inspector::PositionOptions,
+}
+
+impl Task for ExtractTextWithPositionsTask {
+    type Output = Vec<TextItem>;
+    type JsValue = Vec<TextItem>;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let bytes = std::mem::take(&mut self.bytes);
+        let pages = self.pages.take();
+        let position = self.position;
+        catch_panic(
+            "extract_text_with_positions",
+            panic::AssertUnwindSafe(move || extract_text_with_positions_impl(&bytes, pages, position)),
+        )
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+/// Async variant of [`extractTextWithPositions`]: same result, but the
+/// extraction runs on the libuv thread pool instead of the event loop and
+/// the call returns a promise. Options are validated before the call
+/// returns (an unknown frame throws synchronously, as in the sync call), and
+/// the buffer is copied then, so it may be reused or mutated immediately.
+#[napi(ts_return_type = "Promise<Array<TextItem>>")]
+pub fn extract_text_with_positions_async(
+    buffer: Buffer,
+    pages: Option<Vec<u32>>,
+    options: Option<FrameOptions>,
+) -> Result<AsyncTask<ExtractTextWithPositionsTask>> {
+    let position = position_options(options.as_ref(), "extract_text_with_positions_async")?;
+    Ok(AsyncTask::new(ExtractTextWithPositionsTask {
+        bytes: buffer.to_vec(),
+        pages,
+        position,
+    }))
+}
+
+/// An sRGB colour as the `[red, green, blue]` array the Node API reports.
+fn convert_color(color: [u8; 3]) -> Vec<u32> {
+    color
+        .iter()
+        .map(|&component| u32::from(component))
+        .collect()
+}
+
+fn convert_text_item(item: pdf_inspector::TextItem) -> TextItem {
+    let (item_type, link_url) = convert_item_type(&item.item_type);
+    TextItem {
+        text: item.text,
+        x: item.x as f64,
+        y: item.y as f64,
+        width: item.width as f64,
+        height: item.height as f64,
+        font: item.font,
+        font_tag: item.font_tag,
+        legacy_symbol_rewrite: item.legacy_symbol_rewrite.then_some(true),
+        font_size: item.font_size as f64,
+        page: item.page,
+        is_bold: item.is_bold,
+        is_italic: item.is_italic,
+        font_weight: item.font_weight.map(u32::from),
+        bold_source: item.bold_source.map(convert_bold_source),
+        fixed_pitch: item.fixed_pitch,
+        fill_color: item.fill_color.map(convert_color),
+        stroke_color: item.stroke_color.map(convert_color),
+        render_mode: item.render_mode.map(u32::from),
+        is_underline: item.is_underline,
+        is_strikeout: item.is_strikeout,
+        rotation: item.rotation as f64,
+        advance_known: item.advance_known,
+        baseline_shift: item.baseline_shift as f64,
+        item_type,
+        link_url,
+        mcid: item.mcid,
+    }
+}
+
+/// The coordinate frame of a page whose text was predominantly rotated.
+#[napi(object)]
+pub struct PageRotation {
+    /// 1-indexed page number, matching `TextItem.page`.
+    pub page: u32,
+    /// `"ccw"` when the page's runs read bottom-to-top and the frame was
+    /// turned so they read left-to-right, `"cw"` for runs reading
+    /// top-to-bottom.
+    pub rotation: String,
+}
+
+/// Positioned text plus the frame of every page whose text was turned.
+#[napi(object)]
+pub struct PositionedText {
+    pub items: Vec<TextItem>,
+    /// One entry per re-based page; pages absent here are upright and their
+    /// items are in plain page coordinates.
+    pub page_rotations: Vec<PageRotation>,
+}
+
+/// Extract text with positions from a PDF Buffer, together with the
+/// coordinate frame of every page whose text was predominantly rotated.
+/// Items on such a page are expressed in the turned frame (their dominant
+/// runs read left-to-right there); pages absent from `pageRotations` are
+/// upright.
+///
+/// `pages` is 1-indexed (matching `TextItem.page`); omit it for the whole
+/// document. `options.frame` selects the coordinate frame (see
+/// [`FrameOptions`]); with `"display"` the turn of a rotated page is undone
+/// and every item is in the rendered page's frame, while `pageRotations`
+/// keeps reporting which pages were turned.
+#[napi]
+pub fn extract_text_with_positions_and_rotations(
+    buffer: Buffer,
+    pages: Option<Vec<u32>>,
+    options: Option<FrameOptions>,
+) -> Result<PositionedText> {
+    let bytes: Vec<u8> = buffer.to_vec();
+    let position = position_options(
+        options.as_ref(),
+        "extract_text_with_positions_and_rotations",
+    )?;
+    catch_panic("extract_text_with_positions_and_rotations", move || {
+        let page_set: Option<HashSet<u32>> = pages.map(|p| p.into_iter().collect());
+        let (items, rotations) =
+            pdf_inspector::extract_text_with_positions_and_rotations_mem_with_options(
+                &bytes,
+                page_set.as_ref(),
+                position,
+            )
+            .map_err(|e| to_napi_err(e, "extract_text_with_positions_and_rotations"))?;
+        let mut page_rotations: Vec<PageRotation> = rotations
             .into_iter()
-            .map(|item| {
-                let (item_type, link_url) = convert_item_type(&item.item_type);
-                TextItem {
-                    text: item.text,
-                    x: item.x as f64,
-                    y: item.y as f64,
-                    width: item.width as f64,
-                    height: item.height as f64,
-                    font: item.font,
-                    font_size: item.font_size as f64,
-                    page: item.page,
-                    is_bold: item.is_bold,
-                    is_italic: item.is_italic,
-                    item_type,
-                    link_url,
-                }
+            .filter_map(|(page, rotation)| {
+                let rotation = match rotation {
+                    pdf_inspector::PageRotation::Upright => return None,
+                    pdf_inspector::PageRotation::Ccw => "ccw",
+                    pdf_inspector::PageRotation::Cw => "cw",
+                };
+                Some(PageRotation {
+                    page,
+                    rotation: rotation.to_string(),
+                })
+            })
+            .collect();
+        page_rotations.sort_by_key(|r| r.page);
+        Ok(PositionedText {
+            items: items.into_iter().map(convert_text_item).collect(),
+            page_rotations,
+        })
+    })
+}
+
+/// One structure-tree element reference from a tagged PDF.
+#[napi(object)]
+pub struct StructureElementJs {
+    /// 1-indexed page number (matches `TextItem.page`).
+    pub page: u32,
+    /// Marked Content ID from the page's content stream (matches
+    /// `TextItem.mcid`).
+    pub mcid: i64,
+    /// Standard structure type name ("H1".."H6", "P", "Table", "TD", …).
+    /// Custom tags are resolved through the document's role map; tags with
+    /// no standard mapping are returned verbatim.
+    pub role: String,
+}
+
+/// Extract structure-tree element references from a tagged PDF.
+///
+/// Parses the document's structure tree (when present) and returns one
+/// entry per marked-content reference, resolved to its 1-indexed page,
+/// MCID, and structure type name. Returns an empty array when the PDF is
+/// not tagged.
+///
+/// Join `(page, mcid)` against the `page`/`mcid` fields from
+/// [`extractTextWithPositions`] to attach heading levels (H1..H6) and other
+/// semantic roles to extracted text.
+///
+/// Pass 1-indexed page numbers (matching `TextItem.page`) to restrict
+/// output; omit `pages` for the whole document. Entries are sorted by
+/// `(page, mcid)`.
+#[napi]
+pub fn extract_structure_elements(
+    buffer: Buffer,
+    pages: Option<Vec<u32>>,
+) -> Result<Vec<StructureElementJs>> {
+    let bytes: Vec<u8> = buffer.to_vec();
+    catch_panic("extract_structure_elements", move || {
+        let elements = pdf_inspector::extract_structure_elements_mem(&bytes, pages.as_deref())
+            .map_err(|e| to_napi_err(e, "extract_structure_elements"))?;
+        Ok(elements
+            .into_iter()
+            .map(|e| StructureElementJs {
+                page: e.page,
+                mcid: e.mcid,
+                role: e.role,
             })
             .collect())
     })
@@ -377,18 +1010,29 @@ pub fn extract_text_with_positions(
 /// Each region result includes `needsOcr` — set when the extracted text
 /// is unreliable (empty, GID-encoded fonts, garbage, encoding issues).
 ///
-/// Coordinates are PDF points with top-left origin.
+/// Coordinates are PDF points with top-left origin, relative to the visible
+/// page box (`CropBox ∩ MediaBox`, else the MediaBox) — the same box
+/// [`extractTextWithPositions`] reports items in, flipped to a top-left
+/// origin: a positioned `y` becomes `boxHeight - y`. For text items `y` is
+/// the baseline, so `[x, boxHeight - y - height, x + width, boxHeight - y]`
+/// covers the glyph band above the baseline; for image, link and form-field
+/// items `y` is the rect bottom and that box is exact. `/Rotate` is not
+/// applied by default; pass `{ frame: "display" }` (see [`FrameOptions`]) to
+/// give bboxes on the rendered page instead.
 #[napi]
 pub fn extract_text_in_regions(
     buffer: Buffer,
     page_regions: Vec<PageRegions>,
+    options: Option<FrameOptions>,
 ) -> Result<Vec<PageRegionTexts>> {
     let bytes: Vec<u8> = buffer.to_vec();
     let regions = parse_page_regions(&page_regions);
+    let position = position_options(options.as_ref(), "extract_text_in_regions")?;
 
     catch_panic("extract_text_in_regions", move || {
-        let results = pdf_inspector::extract_text_in_regions_mem(&bytes, &regions)
-            .map_err(|e| to_napi_err(e, "extract_text_in_regions"))?;
+        let results =
+            pdf_inspector::extract_text_in_regions_mem_with_options(&bytes, &regions, position)
+                .map_err(|e| to_napi_err(e, "extract_text_in_regions"))?;
         Ok(to_page_region_texts(results))
     })
 }
@@ -402,18 +1046,23 @@ pub fn extract_text_in_regions(
 /// `needsOcr` is `false`. When no table is found, `text` is empty and
 /// `needsOcr` is `true` so the caller can fall back to GPU OCR.
 ///
-/// Coordinates are PDF points with top-left origin.
+/// Coordinates are PDF points with top-left origin, relative to the visible
+/// page box (see `extractTextInRegions`); `options.frame` selects the frame
+/// the same way.
 #[napi]
 pub fn extract_tables_in_regions(
     buffer: Buffer,
     page_regions: Vec<PageRegions>,
+    options: Option<FrameOptions>,
 ) -> Result<Vec<PageRegionTexts>> {
     let bytes: Vec<u8> = buffer.to_vec();
     let regions = parse_page_regions(&page_regions);
+    let position = position_options(options.as_ref(), "extract_tables_in_regions")?;
 
     catch_panic("extract_tables_in_regions", move || {
-        let results = pdf_inspector::extract_tables_in_regions_mem(&bytes, &regions)
-            .map_err(|e| to_napi_err(e, "extract_tables_in_regions"))?;
+        let results =
+            pdf_inspector::extract_tables_in_regions_mem_with_options(&bytes, &regions, position)
+                .map_err(|e| to_napi_err(e, "extract_tables_in_regions"))?;
         Ok(to_page_region_texts(results))
     })
 }
@@ -424,7 +1073,8 @@ pub fn extract_tables_in_regions(
 /// `null` when the region does not contain a valid vector grid.
 ///
 /// `pageIdx` is 0-indexed. `regionPdfPtBbox` is `[x1,y1,x2,y2]` in PDF
-/// points with top-left origin. `renderDpi` is the DPI of the crop image that
+/// points with top-left origin, relative to the visible page box (see
+/// `extractTextInRegions`). `renderDpi` is the DPI of the crop image that
 /// will consume the returned cell bboxes.
 #[napi]
 pub fn detect_vector_grid_in_region(
@@ -477,7 +1127,8 @@ pub struct TsrTableInputJs {
     /// 0-indexed page number where the crop was taken from.
     pub page: u32,
     /// Crop bbox on the page, `[x1, y1, x2, y2]` in PDF points with
-    /// top-left origin.
+    /// top-left origin, relative to the visible page box (see
+    /// `extractTextInRegions`).
     pub crop_pdf_pt_bbox: Vec<f64>,
     /// DPI the crop image was rendered at (e.g. `200.0`).
     pub render_dpi: f64,
@@ -527,7 +1178,8 @@ pub struct StructuredCellJs {
     /// Text extracted from the native PDF for this cell (may be empty).
     pub text: String,
     /// Axis-aligned bbox `[x1, y1, x2, y2]` in page PDF-points, top-left
-    /// origin. Useful for debug overlays or per-cell post-processing.
+    /// origin, relative to the visible page box (the crop's own frame).
+    /// Useful for debug overlays or per-cell post-processing.
     pub page_pt_bbox: Vec<f64>,
 }
 
@@ -657,6 +1309,8 @@ pub struct PageMarkdownResult {
     pub markdown: String,
     /// `true` when text on this page is unreliable.
     pub needs_ocr: bool,
+    /// Machine-readable OCR reason when the cause is known.
+    pub ocr_reason: Option<String>,
 }
 
 /// Combined per-page markdown extraction and layout classification result.
@@ -670,6 +1324,8 @@ pub struct PagesExtractionResult {
     pub pages_with_columns: Vec<u32>,
     /// 1-indexed pages that need OCR (scanned/image-based).
     pub pages_needing_ocr: Vec<u32>,
+    /// Machine-readable OCR reasons by 1-indexed page.
+    pub ocr_reasons_by_page: Vec<PageOcrReasons>,
     /// True if any page has tables or columns.
     pub is_complex: bool,
 }
@@ -691,23 +1347,32 @@ pub fn extract_pages_markdown(
 ) -> Result<PagesExtractionResult> {
     let bytes: Vec<u8> = buffer.to_vec();
     catch_panic("extract_pages_markdown", move || {
-        let result = pdf_inspector::extract_pages_markdown_mem(&bytes, pages.as_deref())
-            .map_err(|e| to_napi_err(e, "extract_pages_markdown"))?;
-        Ok(PagesExtractionResult {
-            pages: result
-                .pages
-                .into_iter()
-                .map(|r| PageMarkdownResult {
-                    page: r.page,
-                    markdown: r.markdown,
-                    needs_ocr: r.needs_ocr,
-                })
-                .collect(),
-            pages_with_tables: result.pages_with_tables,
-            pages_with_columns: result.pages_with_columns,
-            pages_needing_ocr: result.pages_needing_ocr,
-            is_complex: result.is_complex,
-        })
+        extract_pages_markdown_impl(&bytes, pages.as_deref())
+    })
+}
+
+fn extract_pages_markdown_impl(
+    bytes: &[u8],
+    pages: Option<&[u32]>,
+) -> Result<PagesExtractionResult> {
+    let result = pdf_inspector::extract_pages_markdown_mem(bytes, pages)
+        .map_err(|e| to_napi_err(e, "extract_pages_markdown"))?;
+    Ok(PagesExtractionResult {
+        pages: result
+            .pages
+            .into_iter()
+            .map(|r| PageMarkdownResult {
+                page: r.page,
+                markdown: r.markdown,
+                needs_ocr: r.needs_ocr,
+                ocr_reason: r.ocr_reason,
+            })
+            .collect(),
+        pages_with_tables: result.pages_with_tables,
+        pages_with_columns: result.pages_with_columns,
+        pages_needing_ocr: result.pages_needing_ocr,
+        ocr_reasons_by_page: to_napi_page_ocr_reasons(result.ocr_reasons_by_page),
+        is_complex: result.is_complex,
     })
 }
 
@@ -742,40 +1407,179 @@ fn to_page_region_texts(results: Vec<pdf_inspector::PageRegionResult>) -> Vec<Pa
                 .map(|r| RegionText {
                     text: r.text,
                     needs_ocr: r.needs_ocr,
+                    ocr_reason: r.ocr_reason,
                 })
                 .collect(),
         })
         .collect()
 }
 
-fn convert_image_format(f: &pdf_inspector::ImageFormat) -> ImageFormat {
-    match f {
-        pdf_inspector::ImageFormat::Jpeg => ImageFormat::Jpeg,
-        pdf_inspector::ImageFormat::Png => ImageFormat::Png,
+// ---------------------------------------------------------------------------
+// Async variants (libuv thread pool via AsyncTask)
+//
+// The synchronous exports above parse on the calling thread, which in Node is
+// the event loop. These `*Async` variants run the same shared implementations
+// on the libuv thread pool and hand JavaScript a promise, so servers under
+// concurrent load keep answering requests while a document parses. The sync
+// exports keep their names, signatures, and behaviour.
+//
+// Each factory copies the input Buffer to an owned `Vec<u8>` on the calling
+// (JS) thread — deliberately. JS execution is single-threaded, so no JS code
+// can mutate the buffer while the synchronous part of the call copies it.
+// Holding the napi `Buffer` and reading it from the worker instead would be
+// zero-copy, but a caller mutating the buffer before the promise settles
+// would then race the worker's reads — undefined behavior, not a recoverable
+// error (a known napi-rs soundness hazard with cross-thread Buffer access).
+// The copy is a one-time memcpy, negligible next to the parse it unblocks.
+// ---------------------------------------------------------------------------
+
+pub struct ProcessPdfTask {
+    bytes: Vec<u8>,
+    pages: Option<Vec<u32>>,
+}
+
+impl Task for ProcessPdfTask {
+    type Output = PdfResult;
+    type JsValue = PdfResult;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let bytes = std::mem::take(&mut self.bytes);
+        let pages = self.pages.take();
+        // AssertUnwindSafe: `bytes`/`pages` are moved into the closure and
+        // dropped on unwind — no shared state can be observed broken.
+        catch_panic(
+            "process_pdf",
+            panic::AssertUnwindSafe(move || process_pdf_impl(&bytes, pages)),
+        )
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
     }
 }
 
-/// Extract images from a PDF Buffer.
+/// Async variant of [`processPdf`]: same result, but the parse runs on the
+/// libuv thread pool instead of the event loop and the call returns a
+/// promise. The buffer is copied before the call returns, so it may be
+/// reused or mutated immediately.
+// ts_return_type is required: napi-rs emits `Promise<unknown>` for
+// `AsyncTask<T>` returns without it.
+#[napi(ts_return_type = "Promise<PdfResult>")]
+pub fn process_pdf_async(buffer: Buffer, pages: Option<Vec<u32>>) -> AsyncTask<ProcessPdfTask> {
+    AsyncTask::new(ProcessPdfTask {
+        bytes: buffer.to_vec(),
+        pages,
+    })
+}
+
+#[cfg(feature = "ocr")]
+pub struct ProcessPdfWithOcrTask {
+    bytes: Vec<u8>,
+    options: Option<OcrOptions>,
+}
+
+#[cfg(feature = "ocr")]
+impl Task for ProcessPdfWithOcrTask {
+    type Output = OcrPdfResult;
+    type JsValue = OcrPdfResult;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let bytes = std::mem::take(&mut self.bytes);
+        let options = self.options.take();
+        catch_panic(
+            "process_pdf_with_ocr",
+            panic::AssertUnwindSafe(move || process_pdf_with_ocr_impl(&bytes, options)),
+        )
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+/// Process a PDF with selective OCR on the libuv thread pool.
 ///
-/// Currently extracts JPEG images (DCTDecode filter) only.
-/// Returns raw image bytes with position and dimension metadata.
-#[napi]
-pub fn extract_images(buffer: Buffer) -> Result<Vec<ExtractedImage>> {
-    let bytes: Vec<u8> = buffer.to_vec();
-    catch_panic("extract_images", move || {
-        let images = pdf_inspector::extract_images_mem(&bytes)
-            .map_err(|e| to_napi_err(e, "extract_images"))?;
-        Ok(images
-            .into_iter()
-            .map(|img| ExtractedImage {
-                page: img.page,
-                x: img.x as f64,
-                y: img.y as f64,
-                width: img.width,
-                height: img.height,
-                format: convert_image_format(&img.format),
-                data: img.data.into(),
-            })
-            .collect())
+/// OCR defaults to Auto, which only loads PDFium, ONNX Runtime, and the OCR
+/// model if native extraction routes at least one page. The input buffer is
+/// copied before the promise is returned and is safe to reuse immediately.
+#[cfg(feature = "ocr")]
+#[napi(ts_return_type = "Promise<OcrPdfResult>")]
+pub fn process_pdf_with_ocr(
+    buffer: Buffer,
+    options: Option<OcrOptions>,
+) -> AsyncTask<ProcessPdfWithOcrTask> {
+    AsyncTask::new(ProcessPdfWithOcrTask {
+        bytes: buffer.to_vec(),
+        options,
+    })
+}
+
+pub struct ClassifyPdfTask {
+    bytes: Vec<u8>,
+}
+
+impl Task for ClassifyPdfTask {
+    type Output = PdfClassification;
+    type JsValue = PdfClassification;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let bytes = std::mem::take(&mut self.bytes);
+        catch_panic(
+            "classify_pdf",
+            panic::AssertUnwindSafe(move || classify_pdf_impl(&bytes)),
+        )
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+/// Async variant of [`classifyPdf`]: same result, but the classification runs
+/// on the libuv thread pool instead of the event loop and the call returns a
+/// promise. The buffer is copied before the call returns, so it may be
+/// reused or mutated immediately.
+#[napi(ts_return_type = "Promise<PdfClassification>")]
+pub fn classify_pdf_async(buffer: Buffer) -> AsyncTask<ClassifyPdfTask> {
+    AsyncTask::new(ClassifyPdfTask {
+        bytes: buffer.to_vec(),
+    })
+}
+
+pub struct ExtractPagesMarkdownTask {
+    bytes: Vec<u8>,
+    pages: Option<Vec<u32>>,
+}
+
+impl Task for ExtractPagesMarkdownTask {
+    type Output = PagesExtractionResult;
+    type JsValue = PagesExtractionResult;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let bytes = std::mem::take(&mut self.bytes);
+        let pages = self.pages.take();
+        catch_panic(
+            "extract_pages_markdown",
+            panic::AssertUnwindSafe(move || extract_pages_markdown_impl(&bytes, pages.as_deref())),
+        )
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+/// Async variant of [`extractPagesMarkdown`]: same result, but the extraction
+/// runs on the libuv thread pool instead of the event loop and the call
+/// returns a promise. The buffer is copied before the call returns, so it
+/// may be reused or mutated immediately.
+#[napi(ts_return_type = "Promise<PagesExtractionResult>")]
+pub fn extract_pages_markdown_async(
+    buffer: Buffer,
+    pages: Option<Vec<u32>>,
+) -> AsyncTask<ExtractPagesMarkdownTask> {
+    AsyncTask::new(ExtractPagesMarkdownTask {
+        bytes: buffer.to_vec(),
+        pages,
     })
 }

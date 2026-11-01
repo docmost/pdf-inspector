@@ -1,12 +1,15 @@
 //! Rectangle-based table detection using union-find clustering.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use log::debug;
 
 use crate::types::{PdfRect, TextItem};
 
 use super::Table;
+
+const DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS: usize = 8;
+const COMPETING_TABLE_MIN_ROWS: usize = 8;
 
 /// Disjoint-set (union-find) with component sizes for clustering indices.
 struct UnionFind {
@@ -75,19 +78,111 @@ pub(crate) fn rects_overlap(a: &(f32, f32, f32, f32), b: &(f32, f32, f32, f32), 
     !(a_right < b_left || b_right < a_left || a_top < b_bottom || b_top < a_bottom)
 }
 
+fn grid_coord(value: f32, cell: f32) -> i32 {
+    (value / cell).floor().clamp(-1_000_000.0, 1_000_000.0) as i32
+}
+
+/// Inclusive grid range. `None` if the rect covers more cells than we will
+/// materialize — those rects are clustered via a bounded fallback.
+fn grid_span(lo: f32, hi: f32, cell: f32) -> Option<std::ops::RangeInclusive<i32>> {
+    let a = grid_coord(lo.min(hi), cell);
+    let b = grid_coord(lo.max(hi), cell);
+    let span = b.saturating_sub(a);
+    if span > 64 {
+        return None;
+    }
+    Some(a..=b)
+}
+
+fn union_bucket_pairs(
+    uf: &mut UnionFind,
+    rects: &[(f32, f32, f32, f32)],
+    bucket: &[usize],
+    tolerance: f32,
+) {
+    let m = bucket.len();
+    let mut pairs = 0usize;
+    'cell: for a in 0..m {
+        let i = bucket[a];
+        if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+            continue;
+        }
+        for &j in &bucket[a + 1..] {
+            if pairs >= MAX_CLUSTER_PAIRS_PER_CELL {
+                break 'cell;
+            }
+            if uf.component_size(j) >= MAX_CLUSTER_RECTS {
+                continue;
+            }
+            pairs += 1;
+            if rects_overlap(&rects[i], &rects[j], tolerance) {
+                uf.union(i, j);
+                if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn union_rect_against_bands(
+    uf: &mut UnionFind,
+    rects: &[(f32, f32, f32, f32)],
+    i: usize,
+    bands: &BTreeMap<i32, Vec<usize>>,
+    lo: i32,
+    hi: i32,
+    tolerance: f32,
+) {
+    if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+        return;
+    }
+    let mut pairs = 0usize;
+    let mut seen = HashSet::new();
+    for (_, bucket) in bands.range(lo..=hi) {
+        for &j in bucket {
+            if !seen.insert(j) {
+                continue;
+            }
+            if pairs >= MAX_CLUSTER_PAIRS_PER_CELL {
+                return;
+            }
+            if i == j || uf.component_size(j) >= MAX_CLUSTER_RECTS {
+                continue;
+            }
+            pairs += 1;
+            if rects_overlap(&rects[i], &rects[j], tolerance) {
+                uf.union(i, j);
+                if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Maximum component size for rect clustering.  No real table has thousands
 /// of cell rects — once a component exceeds this, it is a vector drawing or
 /// page-spanning clipping path.  We skip overlap checks for rects already in
-/// an oversized component, keeping the original O(n²) loop but making it
-/// effectively O(n) for pathological pages.
+/// an oversized component.
 const MAX_CLUSTER_RECTS: usize = 2000;
+
+/// Pairwise-disjoint rects never merge, so a component-size cap does not
+/// stop an all-pairs loop. Rects are hashed into this many points of grid
+/// and compared only against others in the same cell.
+const CLUSTER_GRID_CELL: f32 = 64.0;
+
+/// All-pairs AABB tests allowed inside one grid cell. A real table cell is
+/// tens of points wide, so a 64-pt cell holds a handful of neighbors — not
+/// thousands of stacked drawings.
+const MAX_CLUSTER_PAIRS_PER_CELL: usize = 16_384;
 
 /// Cluster rects by spatial overlap using union-find.
 /// Returns groups of rect indices; only groups with ≥ `min_size` rects are returned.
 ///
-/// Skips overlap checks for rects whose component has already exceeded
-/// [`MAX_CLUSTER_RECTS`], so pages with tens of thousands of vector-drawing
-/// rects complete in milliseconds instead of minutes.
+/// Overlap tests run inside a uniform grid so far-apart rects are never
+/// compared, and each cell is pair-capped so a dense stack cannot go
+/// quadratic or starve an independent table in another cell.
 pub(crate) fn cluster_rects(
     rects: &[(f32, f32, f32, f32)],
     tolerance: f32,
@@ -95,23 +190,144 @@ pub(crate) fn cluster_rects(
 ) -> Vec<Vec<usize>> {
     let n = rects.len();
     let mut uf = UnionFind::new(n);
+    let cell = CLUSTER_GRID_CELL.max(tolerance * 4.0);
 
-    for i in 0..n {
-        // If rect i is already in an oversized component, no point comparing
-        // it against further rects — the component won't be used for table
-        // detection anyway.
+    let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+    let mut large: Vec<usize> = Vec::new();
+    for (idx, &(x, y, w, h)) in rects.iter().enumerate() {
+        match (
+            grid_span(x - tolerance, x + w + tolerance, cell),
+            grid_span(y - tolerance, y + h + tolerance, cell),
+        ) {
+            (Some(xs), Some(ys)) => {
+                for gx in xs {
+                    for gy in ys.clone() {
+                        grid.entry((gx, gy)).or_default().push(idx);
+                    }
+                }
+            }
+            _ => large.push(idx),
+        }
+    }
+
+    let mut keys: Vec<_> = grid.keys().copied().collect();
+    keys.sort_unstable();
+    let mut keys_by_y: BTreeMap<i32, Vec<i32>> = BTreeMap::new();
+    for &key in &keys {
+        union_bucket_pairs(&mut uf, rects, &grid[&key], tolerance);
+        keys_by_y.entry(key.1).or_default().push(key.0);
+    }
+
+    // Oversized spans skip insert. Range-query occupied cells they cover so
+    // later X-ranges are not starved and we do not scan unrelated rows.
+    for &i in &large {
         if uf.component_size(i) >= MAX_CLUSTER_RECTS {
             continue;
         }
-        for j in (i + 1)..n {
-            if rects_overlap(&rects[i], &rects[j], tolerance) {
-                uf.union(i, j);
-                // Check if the merged component just exceeded the cap —
-                // if so, no need to test more pairs for rect i.
+        let (x, y, w, h) = rects[i];
+        let x_lo = grid_coord(x - tolerance, cell);
+        let x_hi = grid_coord(x + w + tolerance, cell);
+        let y_lo = grid_coord(y - tolerance, cell);
+        let y_hi = grid_coord(y + h + tolerance, cell);
+        for (&gy, gxs) in keys_by_y.range(y_lo..=y_hi) {
+            let start = gxs.partition_point(|&gx| gx < x_lo);
+            for &gx in &gxs[start..] {
+                if gx > x_hi {
+                    break;
+                }
+                let bucket = &grid[&(gx, gy)];
+                let mut pairs = 0usize;
+                for &j in bucket {
+                    if pairs >= MAX_CLUSTER_PAIRS_PER_CELL {
+                        break;
+                    }
+                    if uf.component_size(j) >= MAX_CLUSTER_RECTS {
+                        continue;
+                    }
+                    pairs += 1;
+                    if rects_overlap(&rects[i], &rects[j], tolerance) {
+                        uf.union(i, j);
+                        if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+                            break;
+                        }
+                    }
+                }
                 if uf.component_size(i) >= MAX_CLUSTER_RECTS {
                     break;
                 }
             }
+            if uf.component_size(i) >= MAX_CLUSTER_RECTS {
+                break;
+            }
+        }
+    }
+
+    // Oversized-vs-oversized: band on the short axis so stacked or side-by-side
+    // page-spanning rules stay linear. Wide vs tall pairs are matched by
+    // querying the tall X-index; dual-oversized rects occupy every coarse-Y
+    // cell they span.
+    let mut large_x: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
+    let mut large_y: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
+    let mut large_coarse_y: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
+    let mut wide: Vec<usize> = Vec::new();
+    let mut dual: Vec<usize> = Vec::new();
+    for &i in &large {
+        let (x, y, w, h) = rects[i];
+        let xs = grid_span(x - tolerance, x + w + tolerance, cell);
+        let ys = grid_span(y - tolerance, y + h + tolerance, cell);
+        match (xs, ys) {
+            (Some(xs), _) => {
+                for gx in xs {
+                    large_x.entry(gx).or_default().push(i);
+                }
+            }
+            (_, Some(ys)) => {
+                wide.push(i);
+                for gy in ys {
+                    large_y.entry(gy).or_default().push(i);
+                }
+            }
+            _ => {
+                dual.push(i);
+                let coarse = cell * 64.0;
+                match grid_span(y - tolerance, y + h + tolerance, coarse) {
+                    Some(ys) => {
+                        for gy in ys {
+                            large_coarse_y.entry(gy).or_default().push(i);
+                        }
+                    }
+                    None => {
+                        large_coarse_y.entry(i32::MIN).or_default().push(i);
+                    }
+                }
+            }
+        }
+    }
+    for bands in [&large_x, &large_y, &large_coarse_y] {
+        for bucket in bands.values() {
+            union_bucket_pairs(&mut uf, rects, bucket, tolerance);
+        }
+    }
+    // Cross-orientation is |wide|×|tall| if every wide rule spans the page.
+    // Skip that pass when the product cannot be a table (a few rules).
+    let tall_n = large
+        .len()
+        .saturating_sub(wide.len())
+        .saturating_sub(dual.len());
+    let cross_n =
+        (wide.len() + dual.len()).saturating_mul(tall_n) + dual.len().saturating_mul(wide.len());
+    if cross_n > 0 && cross_n <= MAX_CLUSTER_PAIRS_PER_CELL {
+        for &i in wide.iter().chain(&dual) {
+            let (x, _, w, _) = rects[i];
+            let x_lo = grid_coord(x - tolerance, cell);
+            let x_hi = grid_coord(x + w + tolerance, cell);
+            union_rect_against_bands(&mut uf, rects, i, &large_x, x_lo, x_hi, tolerance);
+        }
+        for &i in &dual {
+            let (_, y, _, h) = rects[i];
+            let y_lo = grid_coord(y - tolerance, cell);
+            let y_hi = grid_coord(y + h + tolerance, cell);
+            union_rect_against_bands(&mut uf, rects, i, &large_y, y_lo, y_hi, tolerance);
         }
     }
 
@@ -226,11 +442,91 @@ pub struct RectHintRegion {
 /// Also returns hint regions: bounding boxes of cell-sized rects from clusters
 /// that failed full grid validation.  These can be used to scope heuristic
 /// detection and prevent unrelated items from being merged into tables.
+/// Bounding boxes of chart-bar clusters on the page. Text inside these
+/// regions (axis labels, data values, legends) belongs to a figure and must
+/// not be gridded into a table by any detection strategy.
+pub fn detect_chart_regions(
+    items: &[TextItem],
+    rects: &[PdfRect],
+    page: u32,
+) -> Vec<(f32, f32, f32, f32)> {
+    // Match detect_tables_from_rects: image placeholders are not text and
+    // would defeat the bar-content check.
+    let items_owned: Vec<TextItem> = items
+        .iter()
+        .filter(|i| crate::extractor::is_text_layout_item(i))
+        .cloned()
+        .collect();
+    let items = items_owned.as_slice();
+    let page_rects: Vec<(f32, f32, f32, f32)> = rects
+        .iter()
+        .filter(|r| r.page == page)
+        .map(|r| {
+            let (x, w) = if r.width < 0.0 {
+                (r.x + r.width, -r.width)
+            } else {
+                (r.x, r.width)
+            };
+            let (y, h) = if r.height < 0.0 {
+                (r.y + r.height, -r.height)
+            } else {
+                (r.y, r.height)
+            };
+            (x, y, w, h)
+        })
+        // Origin-anchored page backgrounds/clipping paths are never chart
+        // geometry, and letting one bridge into a bar cluster would inflate
+        // the region to the whole page.
+        .filter(|&(x, y, w, h)| w >= 5.0 && h >= 5.0 && !(x < 5.0 && y < 5.0))
+        .collect();
+    if page_rects.len() < 6 {
+        return Vec::new();
+    }
+    let mut regions = Vec::new();
+    for cluster in &cluster_rects(&page_rects, 3.0, 6) {
+        let group: Vec<(f32, f32, f32, f32)> = cluster.iter().map(|&i| page_rects[i]).collect();
+        if is_chart_bar_cluster(items, &group, page) {
+            let bbox = group.iter().fold(
+                (
+                    f32::INFINITY,
+                    f32::INFINITY,
+                    f32::NEG_INFINITY,
+                    f32::NEG_INFINITY,
+                ),
+                |(x0, y0, x1, y1), &(x, y, w, h)| {
+                    (x0.min(x), y0.min(y), x1.max(x + w), y1.max(y + h))
+                },
+            );
+            regions.push(bbox);
+        }
+    }
+    regions
+}
+
+fn detect_direct_rect_table(
+    items: &[TextItem],
+    rects: &[(f32, f32, f32, f32)],
+    page: u32,
+) -> Option<Table> {
+    detect_table_from_rect_group(items, rects, page)
+        .or_else(|| detect_row_stripe_table(items, rects, page))
+        .or_else(|| detect_stacked_box_table(items, rects, page))
+}
+
 pub fn detect_tables_from_rects(
     items: &[TextItem],
     rects: &[PdfRect],
     page: u32,
 ) -> (Vec<Table>, Vec<RectHintRegion>) {
+    // Strip Image placeholders before column/row clustering — an image's bbox
+    // would otherwise show up as a spurious column edge. See `is_text_layout_item`.
+    let items_owned: Vec<TextItem> = items
+        .iter()
+        .filter(|i| crate::extractor::is_text_layout_item(i))
+        .cloned()
+        .collect();
+    let items = items_owned.as_slice();
+
     // Filter rects on this page; normalize negative widths/heights; skip tiny rects.
     let mut page_rects: Vec<(f32, f32, f32, f32)> = Vec::new(); // (x, y, w, h) normalized
     for r in rects {
@@ -251,6 +547,23 @@ pub fn detect_tables_from_rects(
             continue;
         }
         page_rects.push((x, y, w, h));
+    }
+
+    // Some generators repeat a page-sized clipping/fill rectangle for nearly
+    // every content operation. When those duplicates overwhelmingly dominate
+    // the drawing geometry, they manufacture full-page X/Y edges and make
+    // every synthetic grid cell appear covered. Remove only that strong
+    // duplicate-background shape; a minority of page fills can coexist with
+    // genuine cell geometry and must remain available to the detectors.
+    let normalized_rects =
+        without_page_backgrounds(&page_rects, PageBackgroundRemoval::Overwhelming);
+    if normalized_rects.len() < page_rects.len() {
+        debug!(
+            "page {}: removed {} overwhelming page-background rects",
+            page,
+            page_rects.len() - normalized_rects.len()
+        );
+        page_rects = normalized_rects;
     }
 
     // Remove rects that are much wider than typical cell rects — these are
@@ -370,12 +683,78 @@ pub fn detect_tables_from_rects(
             .collect();
 
         debug!("page {}: {} clusters with >= 6 rects", page, clusters.len());
-        for cluster_indices in &clusters {
+        let mut merge_excluded_cluster_ids: Vec<usize> = Vec::new();
+        for (cluster_id, cluster_indices) in clusters.iter().enumerate() {
             let group_rects: Vec<(f32, f32, f32, f32)> =
                 cluster_indices.iter().map(|&i| page_rects[i]).collect();
-            if let Some(table) = detect_table_from_rect_group(items, &group_rects, page) {
-                tables.push(table);
-            } else if let Some(table) = detect_row_stripe_table(items, &group_rects, page) {
+            // Chart bars are neither table cells nor a hint region — gridding
+            // a chart's axis labels scrambles the page. Skip the cluster
+            // entirely so it can't reach any detector, the merged fallback,
+            // or the hint fallback.
+            if is_chart_bar_cluster(items, &group_rects, page) {
+                // Repeated page fills can dominate the geometry and make a
+                // real shaded-cell table look like a chart. Remove those fills,
+                // re-cluster the remaining geometry, and evaluate valid table
+                // candidates as a competing hypothesis before the chart
+                // rejection wins.
+                let normalized =
+                    without_page_backgrounds(&group_rects, PageBackgroundRemoval::Repeated);
+                let normalized_table = (normalized.len() < group_rects.len())
+                    .then(|| {
+                        cluster_rects(&normalized, 3.0, 6)
+                            .iter()
+                            .filter_map(|indices| {
+                                let candidate: Vec<(f32, f32, f32, f32)> =
+                                    indices.iter().map(|&i| normalized[i]).collect();
+                                if is_chart_bar_cluster(items, &candidate, page) {
+                                    None
+                                } else {
+                                    detect_table_from_rect_group(items, &candidate, page)
+                                        .or_else(|| {
+                                            detect_row_stripe_table_from_cell_rects(
+                                                items, &candidate, page,
+                                            )
+                                        })
+                                        // Small chart panels can still form
+                                        // plausible grids from their labels.
+                                        // Require sustained row evidence; the
+                                        // motivating table has 17 rows.
+                                        .filter(|table| {
+                                            table.rows.len() >= COMPETING_TABLE_MIN_ROWS
+                                        })
+                                }
+                            })
+                            .max_by_key(|table| table.rows.len() * table.columns.len())
+                    })
+                    .flatten();
+                if let Some(table) = normalized_table {
+                    debug!(
+                        "page {}: chart-like cluster normalized from {} to {} rects; accepted {}x{} table hypothesis",
+                        page,
+                        group_rects.len(),
+                        normalized.len(),
+                        table.rows.len(),
+                        table.columns.len()
+                    );
+                    // The accepted hypothesis is based on normalized
+                    // geometry. Keep the original chart-like cluster out of
+                    // the merged fallback: reintroducing its repeated page
+                    // fills can manufacture a wider candidate that replaces
+                    // this valid narrow table below.
+                    merge_excluded_cluster_ids.push(cluster_id);
+                    tables.push(table);
+                    continue;
+                } else {
+                    debug!(
+                        "page {}: skipping chart-bar cluster ({} rects)",
+                        page,
+                        group_rects.len()
+                    );
+                    merge_excluded_cluster_ids.push(cluster_id);
+                    continue;
+                }
+            }
+            if let Some(table) = detect_direct_rect_table(items, &group_rects, page) {
                 tables.push(table);
             } else if let Some((left, right)) = split_wide_cluster(&group_rects, 15.0, 6) {
                 // Cluster was too wide — retry each half independently
@@ -410,12 +789,19 @@ pub fn detect_tables_from_rects(
         // text-based column detection.
         let only_narrow = !tables.is_empty() && tables.iter().all(|t| t.columns.len() <= 3);
         if tables.is_empty() || only_narrow {
-            let total_clustered: usize = clusters.iter().map(|c| c.len()).sum();
-            if clusters.len() >= 3 && total_clustered >= 50 {
+            // Chart clusters stay out of the merge as well.
+            let table_clusters: Vec<&Vec<usize>> = clusters
+                .iter()
+                .enumerate()
+                .filter(|(id, _)| !merge_excluded_cluster_ids.contains(id))
+                .map(|(_, c)| c)
+                .collect();
+            let total_clustered: usize = table_clusters.iter().map(|c| c.len()).sum();
+            if table_clusters.len() >= 3 && total_clustered >= 50 {
                 debug!(
                     "page {}: trying merged-cluster fallback ({} clusters, {} rects{})",
                     page,
-                    clusters.len(),
+                    table_clusters.len(),
                     total_clustered,
                     if only_narrow {
                         ", replacing narrow tables"
@@ -423,7 +809,7 @@ pub fn detect_tables_from_rects(
                         ""
                     }
                 );
-                let all_cluster_rects: Vec<(f32, f32, f32, f32)> = clusters
+                let all_cluster_rects: Vec<(f32, f32, f32, f32)> = table_clusters
                     .iter()
                     .flat_map(|idxs| idxs.iter().map(|&i| page_rects[i]))
                     .collect();
@@ -461,13 +847,15 @@ pub fn detect_tables_from_rects(
         // (row stripes don't overlap so each is its own cluster of 1),
         // try all page rects directly as a row-stripe table.
         // Require ≥15 rects and ≥10 result rows to avoid decorative fill false positives.
-        if tables.is_empty() && clusters.is_empty() && page_rects.len() >= 15 {
-            if let Some(table) = detect_row_stripe_table(items, &page_rects, page) {
+        let row_stripe_rects =
+            without_page_backgrounds(&page_rects, PageBackgroundRemoval::Repeated);
+        if tables.is_empty() && clusters.is_empty() && row_stripe_rects.len() >= 15 {
+            if let Some(table) = detect_row_stripe_table(items, &row_stripe_rects, page) {
                 if table.rows.len() >= 10 {
                     debug!(
                         "page {}: row-stripe fallback succeeded ({} rects, {} rows)",
                         page,
-                        page_rects.len(),
+                        row_stripe_rects.len(),
                         table.rows.len()
                     );
                     tables.push(table);
@@ -482,6 +870,14 @@ pub fn detect_tables_from_rects(
         }
     }
 
+    // NOTE: 3-5 box stacks never reach detect_stacked_box_table — the main
+    // loop requires >=6-rect clusters (and a >=6-rect page). This is a
+    // deliberate precision gate: routing smaller clusters through the
+    // detector was tried and regressed four pdf-evals documents (striped
+    // bullet lists, wrapped regulation text, stats-table columns) while
+    // improving nothing — with so few boxes the anti-prose guards have too
+    // little signal to discriminate. See stacked_box_three_rows_below_
+    // cluster_minimum for the pinned behavior.
     if tables.is_empty() {
         // When no tables detected but clusters exist, generate XY hint regions
         // from cluster bounding boxes to scope heuristic table detection.
@@ -622,6 +1018,243 @@ pub fn detect_tables_from_rects(
 /// overlap or are close (gap < 50pt).  This handles calendar-style layouts where a
 /// month zone's decorative rects split into 2-3 adjacent clusters with small X gaps.
 /// Runs iteratively until no more merges occur.
+/// Detect a single-column table drawn as a vertical stack of boxes, each
+/// holding one short line of text (framework/step lists on slide-style
+/// pages). The normal grid path rejects these — one column means only two
+/// x-edges — so the rows would otherwise flow into surrounding prose as a
+/// run-on paragraph.
+fn detect_stacked_box_table(
+    items: &[TextItem],
+    group_rects: &[(f32, f32, f32, f32)],
+    page: u32,
+) -> Option<Table> {
+    // Candidate row boxes: single-text-line height, substantial width.
+    let cands: Vec<(f32, f32, f32, f32)> = group_rects
+        .iter()
+        .copied()
+        .filter(|&(_, _, w, h)| w >= 100.0 && (8.0..=80.0).contains(&h))
+        .collect();
+    // The row boxes form the largest family of same-width, x-aligned rects
+    // (backgrounds and decor have their own geometry and stay out).
+    let mut boxes: Vec<(f32, f32, f32, f32)> = Vec::new();
+    for &anchor in &cands {
+        let family: Vec<(f32, f32, f32, f32)> = cands
+            .iter()
+            .copied()
+            .filter(|&(x, _, w, h)| {
+                (x - anchor.0).abs() <= 12.0
+                    && (w - anchor.2).abs() <= anchor.2 * 0.15
+                    && (h - anchor.3).abs() <= anchor.3 * 0.3
+            })
+            .collect();
+        if family.len() > boxes.len() {
+            boxes = family;
+        }
+    }
+    if boxes.len() < 3 {
+        return None;
+    }
+    // Boxes flanked at the same y-level — by other rects or by text outside
+    // the family's x-range — are one column of a wider structure. Leave
+    // those to the grid/cell-rect paths instead of collapsing to one column.
+    let flanked = boxes
+        .iter()
+        .filter(|&&(bx, by, bw, bh)| {
+            let rect_sibling = group_rects.iter().any(|&(ox, oy, ow, oh)| {
+                let y_overlap = (by + bh).min(oy + oh) - by.max(oy);
+                oh >= 8.0
+                    && y_overlap > bh * 0.5
+                    && (ox + ow <= bx + 2.0 || ox >= bx + bw - 2.0)
+                    && ow >= 30.0
+            });
+            let text_sibling = items.iter().any(|it| {
+                let cx = it.x + it.width / 2.0;
+                it.page == page
+                    && it.y >= by - 2.0
+                    && it.y <= by + bh + 2.0
+                    && (cx < bx - 5.0 || cx > bx + bw + 5.0)
+                    && it.width >= 10.0
+            });
+            rect_sibling || text_sibling
+        })
+        .count();
+    if flanked * 3 >= boxes.len() {
+        debug!(
+            "  stacked-box rejected: {}/{} boxes flanked by rects or text",
+            flanked,
+            boxes.len()
+        );
+        return None;
+    }
+    boxes.sort_by(|a, b| b.1.total_cmp(&a.1)); // top to bottom (descending y)
+
+    // Merge duplicates (border + fill pairs draw the same box twice), then
+    // require a clean vertical stack: no overlaps beyond a small tolerance.
+    boxes.dedup_by(|a, b| (a.1 - b.1).abs() <= 3.0 && (a.3 - b.3).abs() <= 6.0);
+    if boxes.len() < 3 {
+        return None;
+    }
+    for w in boxes.windows(2) {
+        let (upper, lower) = (w[0], w[1]);
+        let upper_bottom = upper.1;
+        let lower_top = lower.1 + lower.3;
+        if lower_top > upper_bottom + 4.0 {
+            return None; // vertical overlap — not a stack
+        }
+        if upper_bottom - lower_top > upper.3.max(lower.3) {
+            return None; // gap larger than a row — unrelated boxes
+        }
+    }
+
+    // Assign items to boxes; every box needs text and cells must stay short
+    // (prose paragraphs inside stacked frames are page decor, not a table).
+    let mut cells: Vec<Vec<String>> = Vec::with_capacity(boxes.len());
+    let mut item_indices: Vec<usize> = Vec::new();
+    let mut multi_run_boxes = 0usize;
+    for &(bx, by, bw, bh) in &boxes {
+        let mut in_box: Vec<(usize, &TextItem)> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| {
+                it.page == page
+                    && it.y >= by - 2.0
+                    && it.y <= by + bh + 2.0
+                    && it.x + it.width / 2.0 >= bx
+                    && it.x + it.width / 2.0 <= bx + bw
+            })
+            .collect();
+        if in_box.is_empty() {
+            return None;
+        }
+        in_box.sort_by(|a, b| {
+            b.1.line_y()
+                .partial_cmp(&a.1.line_y())
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    a.1.x
+                        .partial_cmp(&b.1.x)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+        // Count horizontally separated text runs inside the box. A single
+        // list row flows as one run; two-plus runs across most boxes means
+        // multi-column content (striped prose or a real grid) that must not
+        // collapse into a one-column table. Same-baseline only: boxed
+        // display/diagram rows legitimately scatter segments at mixed
+        // baselines, and those must stay one row.
+        let mut runs = 1usize;
+        for pair in in_box.windows(2) {
+            let (prev, item) = (pair[0].1, pair[1].1);
+            if (prev.line_y() - item.line_y()).abs() <= 2.0 && item.x - (prev.x + prev.width) > 15.0
+            {
+                runs += 1;
+            }
+        }
+        if runs >= 2 {
+            multi_run_boxes += 1;
+        }
+        let mut text = String::new();
+        let mut last = None;
+        for (_, it) in &in_box {
+            let trimmed = it.text.trim();
+            if !trimmed.is_empty() {
+                super::cell_text::push_cell_item(&mut text, &mut last, it, trimmed);
+            }
+        }
+        if text.is_empty() || text.chars().count() > 120 {
+            return None;
+        }
+        item_indices.extend(in_box.iter().map(|(i, _)| *i));
+        cells.push(vec![text]);
+    }
+    if multi_run_boxes * 2 >= boxes.len() {
+        debug!(
+            "  stacked-box rejected: {}/{} boxes hold multiple text runs",
+            multi_run_boxes,
+            boxes.len()
+        );
+        return None;
+    }
+
+    // Reject prose behind per-line stripe rects: sentence fragments flowing
+    // across rows read as long, function-word-dense cells, while genuine
+    // list-table rows are short labels/titles.
+    const PROSE_WORDS: &[&str] = &[
+        "a", "an", "the", "of", "to", "is", "was", "are", "were", "be", "been", "in", "on", "at",
+        "with", "for", "by", "as", "and", "or", "but", "this", "that", "these", "those", "from",
+        "into", "has", "have", "had", "not", "it", "its", "their", "such", "shall", "which",
+    ];
+    let total_chars: usize = cells.iter().map(|r| r[0].chars().count()).sum();
+    let mean_chars = total_chars / cells.len().max(1);
+    let prose_cells = cells
+        .iter()
+        .filter(|r| {
+            r[0].to_ascii_lowercase()
+                .split(|c: char| !c.is_ascii_alphabetic() && c != '\'')
+                .any(|w| PROSE_WORDS.contains(&w))
+        })
+        .count();
+    if mean_chars > 60 && prose_cells * 5 >= cells.len() * 2 {
+        debug!(
+            "  stacked-box rejected: prose rows (mean {} chars, prose words {}/{})",
+            mean_chars,
+            prose_cells,
+            cells.len()
+        );
+        return None;
+    }
+    // Sentences wrapping across stripe rects: a row ending with a comma, or
+    // a row without terminal punctuation followed by a row starting
+    // lowercase, is mid-sentence flow — not list rows. Genuine label/title
+    // rows produce none of these, so even a small share is disqualifying.
+    let continuations = cells
+        .windows(2)
+        .filter(|pair| {
+            let prev = pair[0][0].trim_end();
+            let next = pair[1][0].trim_start();
+            let prev_open = !prev.ends_with(['.', ':', ';', '!', '?', ')', '"', '%']);
+            let next_lower = next.chars().next().is_some_and(|c| c.is_lowercase());
+            prev.ends_with(',') || (prev_open && next_lower)
+        })
+        .count();
+    if cells.len() >= 2 && (continuations >= 2 || continuations * 4 >= cells.len() - 1) {
+        debug!(
+            "  stacked-box rejected: {}/{} row pairs continue a sentence",
+            continuations,
+            cells.len() - 1
+        );
+        return None;
+    }
+    // Numbered/lettered list items behind decorative stripes stay lists:
+    // "1) content..." / "(ii) content..." / "a. content...".
+    let list_marker = |t: &str| {
+        let t = t.trim_start().strip_prefix('(').unwrap_or(t.trim_start());
+        let marker_len = t.chars().take_while(|c| c.is_ascii_alphanumeric()).count();
+        (1..=3).contains(&marker_len)
+            && t.chars()
+                .nth(marker_len)
+                .is_some_and(|c| c == ')' || c == '.')
+    };
+    let list_rows = cells.iter().filter(|r| list_marker(&r[0])).count();
+    if list_rows * 2 >= cells.len() {
+        debug!(
+            "  stacked-box rejected: {}/{} rows are numbered list items",
+            list_rows,
+            cells.len()
+        );
+        return None;
+    }
+
+    debug!(
+        "page {}: stacked-box table: {} single-column rows",
+        page,
+        cells.len()
+    );
+    let columns = vec![boxes[0].0 + boxes[0].2 / 2.0];
+    let rows: Vec<f32> = boxes.iter().map(|b| b.1 + b.3 / 2.0).collect();
+    Some(Table::new(columns, rows, cells, item_indices))
+}
+
 fn merge_overlapping_hints(mut hints: Vec<RectHintRegion>) -> Vec<RectHintRegion> {
     if hints.len() <= 1 {
         return hints;
@@ -1081,18 +1714,27 @@ pub(crate) fn assign_items_to_grid(
         vec![vec![Vec::new(); num_cols]; num_rows];
     let mut indices = Vec::new();
 
+    // Row bands as baselines for the vertical-run test: a run standing
+    // across rows is judged by the bands it covers.
+    let row_centers: Vec<f32> = (0..num_rows)
+        .map(|r| (row_edges[r] + row_edges[r + 1]) / 2.0)
+        .collect();
     for (idx, item) in items.iter().enumerate() {
         if item.page != page {
             continue;
         }
-        // Use item center for assignment
+        // Use item center for assignment; a super/subscript run is assigned
+        // by the body baseline it belongs to, not its own raised/lowered one.
         let cx = item.x + item.width / 2.0;
-        let cy = item.y;
+        let cy = item.line_y();
 
         // Find column: cx must be between col_edges[c] and col_edges[c+1]
         let col = (0..num_cols).find(|&c| cx >= col_edges[c] - 2.0 && cx <= col_edges[c + 1] + 2.0);
         // Find row: cy must be between row_edges[r+1] (bottom) and row_edges[r] (top)
         let row = (0..num_rows).find(|&r| cy >= row_edges[r + 1] - 2.0 && cy <= row_edges[r] + 2.0);
+        if super::crosses_other_rows(item, &row_centers, row) {
+            continue;
+        }
 
         if let (Some(c), Some(r)) = (col, row) {
             cell_items[r][c].push((idx, item));
@@ -1100,33 +1742,75 @@ pub(crate) fn assign_items_to_grid(
         }
     }
 
-    // Build cell strings: sort items within each cell by Y descending then X ascending
+    // Build cell strings: sort items within each cell by Y descending then X
+    // in reading direction (ascending, or descending for RTL cells — same
+    // direction-awareness as the heuristic detector's cell join)
     let mut cells: Vec<Vec<String>> = Vec::with_capacity(num_rows);
     for row_items in &mut cell_items {
         let mut row_cells = Vec::with_capacity(num_cols);
         for col_items in row_items.iter_mut() {
-            col_items.sort_by(|a, b| {
-                b.1.y
-                    .partial_cmp(&a.1.y)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| {
-                        a.1.x
-                            .partial_cmp(&b.1.x)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-            });
-            let text: String = col_items
-                .iter()
-                .map(|(_, item)| item.text.trim())
-                .filter(|t| !t.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
+            // Direction from strong RTL letters only — a digit-only cell
+            // split across items must not have its number reversed. RTL cells
+            // sort right-to-left in baseline bands with embedded LTR phrases
+            // kept in screen order.
+            let rtl = crate::text_utils::is_rtl_text(col_items.iter().map(|(_, i)| &i.text));
+            if rtl {
+                crate::text_utils::sort_rtl_cell_items(col_items, |(_, i)| *i);
+            } else {
+                col_items.sort_by(|a, b| {
+                    b.1.line_y()
+                        .partial_cmp(&a.1.line_y())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| {
+                            a.1.x
+                                .partial_cmp(&b.1.x)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                });
+            }
+            // A cell holding a super/subscript run goes through the shared
+            // cell joiner so the run keeps its markup and edge spacing
+            // ("V<sub>f</sub>", "Total<sup>2</sup>"); plain cells keep the
+            // space join they always had.
+            let text = if col_items.iter().any(|(_, item)| item.is_script()) {
+                let refs: Vec<&TextItem> = col_items.iter().map(|(_, item)| *item).collect();
+                super::cell_text::join_cell_items(&refs)
+            } else {
+                col_items
+                    .iter()
+                    .map(|(_, item)| item.text.trim())
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let text = remove_inner_delimiter_spaces(&text);
             row_cells.push(text);
         }
         cells.push(row_cells);
     }
 
     (cells, indices)
+}
+
+fn remove_inner_delimiter_spaces(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut result = String::with_capacity(text.len());
+
+    for (i, &ch) in chars.iter().enumerate() {
+        if ch == ' ' {
+            let after_open =
+                result.ends_with('(') || result.ends_with('[') || result.ends_with('{');
+            let before_close = chars
+                .get(i + 1)
+                .is_some_and(|next| matches!(next, ')' | ']' | '}'));
+            if after_open || before_close {
+                continue;
+            }
+        }
+        result.push(ch);
+    }
+
+    result
 }
 
 /// Consolidate text in vertically-merged cells.
@@ -1442,6 +2126,18 @@ fn detect_row_stripe_table(
         (col_edges, cells)
     };
     let num_cols = col_edges.len() - 1;
+    if row_stripe_is_sparse_prose_outline(&cells) {
+        debug!("  row-stripe rejected: sparse outline/prose continuation shape");
+        return None;
+    }
+    if has_dominant_prose_cell(&cells) {
+        debug!("  row-stripe rejected: dominant prose cell (chart/figure region over body text)");
+        return None;
+    }
+    if row_stripe_cells_are_prose(&cells) {
+        debug!("  row-stripe rejected: prose fragments behind stripes");
+        return None;
+    }
 
     let column_centers: Vec<f32> = (0..num_cols)
         .map(|c| (col_edges[c] + col_edges[c + 1]) / 2.0)
@@ -1460,11 +2156,536 @@ fn detect_row_stripe_table(
     Some(Table::new(column_centers, row_centers, cells, item_indices))
 }
 
-/// Detect a table from cell-background rects that failed grid detection.
+/// Detect a grid that swallowed body text instead of tabular data.
 ///
-/// Uses rect Y-edges for row boundaries and text X-position clustering for
-/// columns.  Handles tables with cell backgrounds that don't form a clean
-/// X-edge grid (variable column widths, decorative fills).
+/// Charts (bar graphs, axis gridlines) emit fields of drawing rects that can
+/// pass the row-stripe shape test; the resulting "table" then captures the
+/// page's prose. The signature: one cell holds an entire paragraph — ≥60 words
+/// AND at least a third of all words in the table.
+///
+/// There is deliberately no row-count exemption. A small table whose single
+/// long cell dominates its word count is indistinguishable by content from a
+/// phantom grid over body text, and across the regression corpora every such
+/// grid observed has been swallowed prose, never a real note table. The costs
+/// are also asymmetric: rejecting a real table degrades it to readable prose,
+/// while accepting a phantom scrambles the page into Y-interleaved cells.
+/// Larger legitimate tables are safe because the one-third-of-total threshold
+/// scales with table size.
+fn has_dominant_prose_cell(cells: &[Vec<String>]) -> bool {
+    let mut total_words = 0usize;
+    let mut max_cell_words = 0usize;
+    for row in cells {
+        for cell in row {
+            let words = cell.split_whitespace().count();
+            total_words += words;
+            max_cell_words = max_cell_words.max(words);
+        }
+    }
+    max_cell_words >= 60 && max_cell_words * 3 >= total_words
+}
+
+/// Stripes drawn behind flowing body text produce a grid of paragraph
+/// fragments: nearly every cell is long, multi-sentence prose. Real
+/// row-stripe tables (zebra-striped financial rows) carry short values.
+/// Mirrors the cell-rect prose-in-frame cap.
+fn row_stripe_cells_are_prose(cells: &[Vec<String>]) -> bool {
+    let num_cols = cells.iter().map(Vec::len).max().unwrap_or(0);
+    let mut counted = 0usize;
+    let mut total_chars = 0usize;
+    let mut sentence_cells = 0usize;
+    let mut sentence_columns = vec![false; num_cols];
+    for row in cells {
+        for (col, cell) in row.iter().enumerate() {
+            let t = cell.trim();
+            if t.is_empty() {
+                continue;
+            }
+            counted += 1;
+            total_chars += t.chars().count();
+            if t.split_whitespace().count() >= 10 && t.contains(['.', ',']) {
+                sentence_cells += 1;
+                sentence_columns[col] = true;
+            }
+        }
+    }
+    // Flowing text fills every column with sentences; a genuine striped
+    // narrative table (Q&A, requirements) keeps them in one description
+    // column beside short labels.
+    counted > 0
+        && total_chars / counted > 90
+        && sentence_cells * 2 >= counted
+        && sentence_columns.iter().filter(|&&v| v).count() >= 2
+}
+
+fn row_stripe_is_sparse_prose_outline(cells: &[Vec<String>]) -> bool {
+    let Some(num_cols) = cells.first().map(|row| row.len()) else {
+        return false;
+    };
+    if num_cols != 2 || cells.len() < 4 {
+        return false;
+    }
+
+    let non_empty_rows = cells
+        .iter()
+        .filter(|row| row.iter().any(|cell| !cell.trim().is_empty()))
+        .count();
+    if non_empty_rows < 4 {
+        return false;
+    }
+
+    let mut col_counts = [0usize; 2];
+    for row in cells {
+        for (idx, cell) in row.iter().enumerate() {
+            if !cell.trim().is_empty() {
+                col_counts[idx] += 1;
+            }
+        }
+    }
+
+    let (sparse_col, dense_col) = if col_counts[0] <= col_counts[1] {
+        (0usize, 1usize)
+    } else {
+        (1usize, 0usize)
+    };
+    let sparse_count = col_counts[sparse_col];
+    let dense_count = col_counts[dense_col];
+    if sparse_count * 2 >= non_empty_rows || dense_count * 3 < non_empty_rows * 2 {
+        return false;
+    }
+
+    let blank_sparse_dense_rows = cells
+        .iter()
+        .filter(|row| row[sparse_col].trim().is_empty() && !row[dense_col].trim().is_empty())
+        .count();
+    if blank_sparse_dense_rows * 2 < non_empty_rows {
+        return false;
+    }
+
+    let long_dense_cells = cells
+        .iter()
+        .filter(|row| row[dense_col].split_whitespace().count() >= 6)
+        .count();
+    long_dense_cells * 2 >= dense_count
+}
+
+#[derive(Clone, Copy)]
+enum PageBackgroundRemoval {
+    /// Repeated page fills interfere with chart-vs-grid classification even
+    /// when real cell geometry remains the majority.
+    Repeated,
+    /// Top-level normalization is more conservative: page fills must comprise
+    /// at least 75% of all useful drawing rectangles.
+    Overwhelming,
+}
+
+/// Apply the shared page-scale classification and removal policy used by the
+/// top-level detector and chart recovery.
+fn without_page_backgrounds(
+    rects: &[(f32, f32, f32, f32)],
+    policy: PageBackgroundRemoval,
+) -> Vec<(f32, f32, f32, f32)> {
+    let x_max = rects
+        .iter()
+        .map(|&(x, _, width, _)| x + width)
+        .fold(0.0_f32, f32::max);
+    let y_max = rects
+        .iter()
+        .map(|&(_, y, _, height)| y + height)
+        .fold(0.0_f32, f32::max);
+    let is_page_scale = |&&(x, y, width, height): &&(f32, f32, f32, f32)| {
+        x < 5.0 && y < 5.0 && width >= x_max * 0.9 && height >= y_max * 0.9
+    };
+    let page_scale_count = rects.iter().filter(is_page_scale).count();
+
+    let meets_policy = match policy {
+        PageBackgroundRemoval::Repeated => true,
+        PageBackgroundRemoval::Overwhelming => page_scale_count * 4 >= rects.len() * 3,
+    };
+    if page_scale_count < DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS || !meets_policy {
+        return rects.to_vec();
+    }
+
+    rects
+        .iter()
+        .filter(|rect| !is_page_scale(rect))
+        .copied()
+        .collect()
+}
+
+/// Repeated rows of touching cell rectangles are stronger table evidence
+/// than the bar-length variation used by the chart detector.
+///
+/// Ruled tables with wrapped labels naturally have variable row heights, and
+/// numeric-heavy cells can otherwise resemble horizontal or vertical bars.
+/// Require several rows to repeat a shared edge schema before overriding the
+/// chart hypothesis so sparse plots and independent bars remain unaffected.
+fn is_repeated_cell_grid(group_rects: &[(f32, f32, f32, f32)]) -> bool {
+    type RowGroup = (f32, f32, Vec<(f32, f32)>);
+
+    const ROW_EDGE_TOLERANCE: f32 = 3.0;
+    const MIN_GRID_ROWS: usize = 4;
+    const MIN_CELLS_PER_ROW: usize = 3;
+
+    if group_rects.len() < MIN_GRID_ROWS * MIN_CELLS_PER_ROW {
+        return false;
+    }
+
+    let mut row_groups: Vec<RowGroup> = Vec::new();
+    for &(x, y, width, height) in group_rects {
+        if width < 5.0 || height < 5.0 {
+            continue;
+        }
+        let top = y + height;
+        if let Some((_, _, cells)) = row_groups.iter_mut().find(|(bottom, row_top, _)| {
+            (y - *bottom).abs() <= ROW_EDGE_TOLERANCE
+                && (top - *row_top).abs() <= ROW_EDGE_TOLERANCE
+        }) {
+            cells.push((x, x + width));
+        } else {
+            row_groups.push((y, top, vec![(x, x + width)]));
+        }
+    }
+
+    let mut row_schemas = Vec::new();
+    for (_, _, mut cells) in row_groups {
+        if cells.len() < MIN_CELLS_PER_ROW {
+            continue;
+        }
+        let mut widths: Vec<f32> = cells.iter().map(|&(left, right)| right - left).collect();
+        widths.sort_by(f32::total_cmp);
+        let median_width = widths[widths.len() / 2];
+        cells.retain(|&(left, right)| right - left <= median_width * 2.5);
+        cells.sort_by(|left, right| {
+            left.0
+                .total_cmp(&right.0)
+                .then_with(|| left.1.total_cmp(&right.1))
+        });
+        cells.dedup_by(|left, right| {
+            (left.0 - right.0).abs() <= ROW_EDGE_TOLERANCE
+                && (left.1 - right.1).abs() <= ROW_EDGE_TOLERANCE
+        });
+        if cells.len() < MIN_CELLS_PER_ROW
+            || cells
+                .windows(2)
+                .any(|pair| pair[1].0 > pair[0].1 + ROW_EDGE_TOLERANCE)
+        {
+            continue;
+        }
+        let edges: Vec<f32> = cells
+            .iter()
+            .flat_map(|&(left, right)| [left, right])
+            .collect();
+        let schema = snap_edges(&edges, ROW_EDGE_TOLERANCE);
+        if schema.len() > MIN_CELLS_PER_ROW {
+            row_schemas.push(schema);
+        }
+    }
+    if row_schemas.len() < MIN_GRID_ROWS {
+        return false;
+    }
+
+    let reference = row_schemas
+        .iter()
+        .max_by_key(|schema| schema.len())
+        .expect("grid rows are non-empty");
+    row_schemas
+        .iter()
+        .filter(|schema| {
+            let comparable_edges = reference.len().min(schema.len());
+            let matched_edges = schema
+                .iter()
+                .filter(|edge| {
+                    reference
+                        .iter()
+                        .any(|reference_edge| (*edge - *reference_edge).abs() <= ROW_EDGE_TOLERANCE)
+                })
+                .count();
+            matched_edges > MIN_CELLS_PER_ROW && matched_edges * 4 >= comparable_edges * 3
+        })
+        .count()
+        >= MIN_GRID_ROWS
+}
+
+fn repeated_cell_grid_overrides_bar_hypothesis(group_rects: &[(f32, f32, f32, f32)]) -> bool {
+    is_repeated_cell_grid(group_rects)
+        && without_page_backgrounds(group_rects, PageBackgroundRemoval::Repeated).len()
+            == group_rects.len()
+}
+
+/// Detect horizontal segmented stacks from aligned rows of touching rects.
+///
+/// Category rows must have visible gutters and data-varying internal segment
+/// boundaries, unlike the stable boundaries of a ruled table.
+struct SegmentedBarGeometry {
+    bounds: (f32, f32, f32, f32),
+    row_bands: Vec<(f32, f32)>,
+}
+
+fn segmented_stacked_bar_geometry(
+    group_rects: &[(f32, f32, f32, f32)],
+) -> Option<SegmentedBarGeometry> {
+    type BarRow = (f32, f32, Vec<(f32, f32)>);
+
+    const EDGE_TOLERANCE: f32 = 3.0;
+    const MIN_ROWS: usize = 4;
+    const MIN_SEGMENTS: usize = 3;
+
+    let mut rows: Vec<BarRow> = Vec::new();
+    for &(x, y, width, height) in group_rects {
+        if width < 5.0 || height < 5.0 {
+            continue;
+        }
+        let top = y + height;
+        if let Some((_, _, segments)) = rows.iter_mut().find(|(bottom, row_top, _)| {
+            (y - *bottom).abs() <= EDGE_TOLERANCE && (top - *row_top).abs() <= EDGE_TOLERANCE
+        }) {
+            segments.push((x, x + width));
+        } else {
+            rows.push((y, top, vec![(x, x + width)]));
+        }
+    }
+
+    rows.retain_mut(|(_, _, segments)| {
+        segments.sort_by(|left, right| left.0.total_cmp(&right.0));
+        segments.len() >= MIN_SEGMENTS
+            && segments
+                .windows(2)
+                .all(|pair| (pair[1].0 - pair[0].1).abs() <= EDGE_TOLERANCE)
+    });
+    if rows.len() < MIN_ROWS {
+        return None;
+    }
+    rows.sort_by(|left, right| left.0.total_cmp(&right.0));
+
+    // Table rows normally share borders. Horizontal stacked bars instead
+    // leave a visible gutter between category rows.
+    if rows.windows(2).any(|pair| {
+        let shorter_height = (pair[0].1 - pair[0].0).min(pair[1].1 - pair[1].0);
+        pair[1].0 - pair[0].1 < (shorter_height * 0.25).max(2.0)
+    }) {
+        return None;
+    }
+
+    // At least two rows must move an internal segment boundary. Stable
+    // boundaries across every row are stronger evidence for a ruled table.
+    let reference_edges: Vec<f32> = rows[0]
+        .2
+        .iter()
+        .take(rows[0].2.len() - 1)
+        .map(|segment| segment.1)
+        .collect();
+    let drifting_rows = rows
+        .iter()
+        .skip(1)
+        .filter(|(_, _, segments)| {
+            let edges: Vec<f32> = segments
+                .iter()
+                .take(segments.len() - 1)
+                .map(|segment| segment.1)
+                .collect();
+            edges.len() == reference_edges.len()
+                && edges
+                    .iter()
+                    .zip(&reference_edges)
+                    .any(|(edge, reference)| (edge - reference).abs() > EDGE_TOLERANCE)
+        })
+        .count();
+    if drifting_rows < 2 {
+        return None;
+    }
+
+    let left = rows
+        .iter()
+        .flat_map(|row| &row.2)
+        .map(|segment| segment.0)
+        .reduce(f32::min)?;
+    let right = rows
+        .iter()
+        .flat_map(|row| &row.2)
+        .map(|segment| segment.1)
+        .reduce(f32::max)?;
+    let bottom = rows.iter().map(|row| row.0).reduce(f32::min)?;
+    let top = rows.iter().map(|row| row.1).reduce(f32::max)?;
+    let row_bands = rows.iter().map(|row| (row.0, row.1)).collect();
+    Some(SegmentedBarGeometry {
+        bounds: (left, bottom, right, top),
+        row_bands,
+    })
+}
+
+/// Category labels beside multiple bar rows are independent chart evidence:
+/// numeric table text stays inside its cells, regardless of whether the table
+/// has an outer border or extra padding.
+fn has_external_segmented_bar_labels(
+    items: &[TextItem],
+    page: u32,
+    geometry: &SegmentedBarGeometry,
+) -> bool {
+    const LABEL_EDGE_TOLERANCE: f32 = 3.0;
+    const LABEL_CLAIM_PAD: f32 = 20.0;
+
+    let (content_left, _, content_right, _) = geometry.bounds;
+    let labeled_rows = geometry
+        .row_bands
+        .iter()
+        .filter(|&&(row_bottom, row_top)| {
+            items.iter().any(|item| {
+                if item.page != page || item.text.trim().is_empty() {
+                    return false;
+                }
+                let item_left = item.x.min(item.x + item.width);
+                let item_right = item.x.max(item.x + item.width);
+                let item_center_x = (item_left + item_right) / 2.0;
+                let item_center_y = item.y + item.height / 2.0;
+                let beside_stack = (item_center_x <= content_left + LABEL_EDGE_TOLERANCE
+                    && item_center_x >= content_left - LABEL_CLAIM_PAD
+                    && item_left < content_left)
+                    || (item_center_x >= content_right - LABEL_EDGE_TOLERANCE
+                        && item_center_x <= content_right + LABEL_CLAIM_PAD
+                        && item_right > content_right);
+                beside_stack
+                    && item_center_y >= row_bottom - LABEL_EDGE_TOLERANCE
+                    && item_center_y <= row_top + LABEL_EDGE_TOLERANCE
+            })
+        })
+        .count();
+
+    labeled_rows >= 2 && labeled_rows * 2 >= geometry.row_bands.len()
+}
+
+/// Recognize filled vertical or horizontal bars whose geometry and labels are
+/// data-driven rather than uniform table cells.
+fn has_chart_bar_signature(
+    items: &[TextItem],
+    group_rects: &[(f32, f32, f32, f32)],
+    page: u32,
+) -> bool {
+    let numeric_or_empty = |(rx, ry, rw, rh): (f32, f32, f32, f32)| {
+        let inside: Vec<&TextItem> = items
+            .iter()
+            .filter(|it| {
+                let cx = it.x + it.width / 2.0;
+                it.page == page && cx >= rx && cx <= rx + rw && it.y >= ry && it.y <= ry + rh
+            })
+            .collect();
+        // Any number of numeric data labels is chart-like; a single run of
+        // word text inside means a table cell.
+        inside.iter().all(|it| {
+            let t = it.text.trim();
+            let data = t
+                .chars()
+                .filter(|c| c.is_ascii_digit() || ",.%-".contains(*c))
+                .count();
+            t.is_empty() || data * 2 >= t.chars().count()
+        })
+    };
+
+    // Bars: the dominant equal-width family, arranged in >=2 spaced columns
+    // (inter-column gap >= half a bar width — table cell rects touch), with
+    // data-driven height variation (checkbox/cell grids are uniform).
+    // Mirrored predicate catches horizontal bar charts.
+    let bar_family = |pos: fn(&(f32, f32, f32, f32)) -> f32,
+                      breadth: fn(&(f32, f32, f32, f32)) -> f32,
+                      length: fn(&(f32, f32, f32, f32)) -> f32,
+                      along: fn(&(f32, f32, f32, f32)) -> f32| {
+        group_rects.iter().any(|anchor| {
+            let bw = breadth(anchor);
+            if bw <= 0.0 {
+                return false;
+            }
+            let family: Vec<&(f32, f32, f32, f32)> = group_rects
+                .iter()
+                .filter(|r| {
+                    (breadth(r) - bw).abs() <= (bw * 0.1).max(2.0)
+                        && length(r) > 0.0
+                        && length(r) < bw * 20.0
+                })
+                .collect();
+            if family.len() < 4 {
+                return false;
+            }
+            // Distinct positions along the axis (bar columns).
+            let mut positions: Vec<f32> = Vec::new();
+            for r in &family {
+                let p = pos(r);
+                if !positions.iter().any(|&q| (q - p).abs() <= 2.0) {
+                    positions.push(p);
+                }
+            }
+            if positions.len() < 2 {
+                return false;
+            }
+            positions.sort_by(|a, b| a.total_cmp(b));
+            let min_gap = positions
+                .windows(2)
+                .map(|w| w[1] - w[0] - bw)
+                .fold(f32::INFINITY, f32::min);
+            if min_gap < bw * 0.5 {
+                return false;
+            }
+            // Data-driven variation along the bar direction.
+            let len_min = family
+                .iter()
+                .map(|r| length(r))
+                .fold(f32::INFINITY, f32::min);
+            let len_max = family
+                .iter()
+                .map(|r| length(r))
+                .fold(f32::NEG_INFINITY, f32::max);
+            if len_max < len_min * 1.3 {
+                return false;
+            }
+            // Grid rows disguise as bars: a table's cell rects have same-y,
+            // same-height partners in other columns (uniform row heights).
+            // Chart segments start where the previous datum ended, so their
+            // extents rarely pair up across positions.
+            let matched = family
+                .iter()
+                .filter(|r| {
+                    family.iter().any(|s| {
+                        (pos(s) - pos(r)).abs() > 2.0
+                            && (along(s) - along(r)).abs() <= 3.0
+                            && (length(s) - length(r)).abs() <= 3.0
+                    })
+                })
+                .count();
+            if matched * 5 >= family.len() * 3 {
+                return false;
+            }
+            family.iter().filter(|r| numeric_or_empty(***r)).count() * 3 >= family.len() * 2
+        })
+    };
+
+    // vertical bars: position/breadth = x/width, length = height, along = y
+    bar_family(|r| r.0, |r| r.2, |r| r.3, |r| r.1)
+        // horizontal bars: position/breadth = y/height, length = width, along = x
+        || bar_family(|r| r.1, |r| r.3, |r| r.2, |r| r.0)
+}
+
+fn is_chart_bar_cluster(
+    items: &[TextItem],
+    group_rects: &[(f32, f32, f32, f32)],
+    page: u32,
+) -> bool {
+    let has_bar_signature = has_chart_bar_signature(items, group_rects, page);
+
+    // A segmented horizontal chart can share most of its edges across rows.
+    // Row-aligned category labels outside the stack distinguish it from a
+    // numeric table without depending on whether either shape has a frame.
+    if has_bar_signature {
+        if let Some(geometry) = segmented_stacked_bar_geometry(group_rects) {
+            if has_external_segmented_bar_labels(items, page, &geometry) {
+                return true;
+            }
+        }
+    }
+    if repeated_cell_grid_overrides_bar_hypothesis(group_rects) {
+        return false;
+    }
+
+    has_bar_signature
+}
+
 fn detect_row_stripe_table_from_cell_rects(
     items: &[TextItem],
     group_rects: &[(f32, f32, f32, f32)],
@@ -2208,6 +3429,12 @@ fn detect_merged_cluster_table(
         );
         return None;
     }
+    if has_dominant_prose_cell(&cells) {
+        debug!(
+            "  merged-cluster rejected: dominant prose cell (chart/figure region over body text)"
+        );
+        return None;
+    }
 
     // No empty columns
     for col in 0..num_cols {
@@ -2243,7 +3470,29 @@ fn detect_merged_cluster_table(
 /// suitable for rect-backed tables where we already know tabular structure exists
 /// (no need for anti-paragraph safeguards).
 fn cluster_x_positions(items: &[(usize, &TextItem)], min_threshold: f32) -> Vec<f32> {
-    let mut x_positions: Vec<f32> = items.iter().map(|(_, i)| i.x).collect();
+    // Column edges come from where text STARTS. An item whose left edge hugs
+    // the previous item's right edge on the same line is a continuation run
+    // (style boundary, script change, underline split) — feeding its x-start
+    // in here fabricates a phantom column mid-cell.
+    let mut sorted: Vec<&TextItem> = items.iter().map(|&(_, i)| i).collect();
+    sorted.sort_by(|a, b| a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)));
+    let mut x_positions: Vec<f32> = Vec::with_capacity(sorted.len());
+    for (idx, item) in sorted.iter().enumerate() {
+        let is_continuation = idx > 0 && {
+            let prev = sorted[idx - 1];
+            // Style/underline splits leave runs that TOUCH (gap ~0); real
+            // cell boundaries in even the tightest tables keep a visible
+            // gap. 2pt separates the two without eating dense-table columns.
+            // The negative side is bounded too: text overhanging from an
+            // adjacent cell overlaps by far more than italic kerning ever
+            // does, and must still start its own column.
+            let gap = item.x - (prev.x + prev.width);
+            (prev.y - item.y).abs() <= 2.0 && gap < 2.0 && gap > -4.0 && item.x >= prev.x
+        };
+        if !is_continuation {
+            x_positions.push(item.x);
+        }
+    }
     x_positions.sort_by(|a, b| a.total_cmp(b));
 
     if x_positions.is_empty() {
@@ -2290,6 +3539,32 @@ fn cluster_x_positions(items: &[(usize, &TextItem)], min_threshold: f32) -> Vec<
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn row_stripe_prose_fragments_are_rejected() {
+        let prose = vec![
+            vec![
+                "The other potentially invasive fouler is the tropical American species in low abundances near the harbor entrance today."
+                    .to_string(),
+                "Mytilopsis sallei and M. adamsi which has been recorded invasive in Singapore, Australia, Thailand among other regions of the coast."
+                    .to_string(),
+            ],
+            vec![
+                "Figure 3. Non-indigenous macrofoulers from Manila Bay with IAS, based on more intensive biofouling ecological monitoring efforts."
+                    .to_string(),
+                "Newer estimates on the number of possible IAS in Manila Bay is likely more than 30 species, when research started on this topic."
+                    .to_string(),
+            ],
+        ];
+        assert!(super::row_stripe_cells_are_prose(&prose));
+
+        let zebra = vec![
+            vec!["Revenue".to_string(), "$1,240".to_string()],
+            vec!["Cost of goods".to_string(), "$310".to_string()],
+            vec!["Net margin".to_string(), "24%".to_string()],
+        ];
+        assert!(!super::row_stripe_cells_are_prose(&zebra));
+    }
+
     use super::*;
     use crate::types::ItemType;
 
@@ -2301,13 +3576,601 @@ mod tests {
             width: text.len() as f32 * font_size * 0.5,
             height: font_size,
             font: "TestFont".to_string(),
+            font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size,
             page: 1,
             is_bold: false,
             is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
+            is_underline: false,
+            is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         }
+    }
+
+    // --- is_chart_bar_cluster / detect_chart_regions ---
+
+    /// Stacked bar chart: frame + 3 columns of equal-width segments with
+    /// data-driven heights, holding numeric labels.
+    fn chart_rects() -> Vec<PdfRect> {
+        let mut rects = vec![PdfRect {
+            x: 126.0,
+            y: 548.0,
+            width: 396.0,
+            height: 216.0,
+            page: 1,
+        }];
+        let bars = [
+            (208.0, 618.0, 59.0),
+            (208.0, 661.0, 39.0),
+            (208.0, 696.0, 37.0),
+            (313.0, 618.0, 67.0),
+            (313.0, 670.0, 49.0),
+            (313.0, 691.0, 42.0),
+            (419.0, 618.0, 73.0),
+            (419.0, 684.0, 37.0),
+            (419.0, 708.0, 25.0),
+        ];
+        for (x, y, h) in bars {
+            rects.push(PdfRect {
+                x,
+                y,
+                width: 46.0,
+                height: h,
+                page: 1,
+            });
+        }
+        rects
+    }
+
+    #[test]
+    fn chart_bars_produce_region_not_table() {
+        let items: Vec<TextItem> = [
+            ("38", 228.0, 638.0),
+            ("30", 228.0, 676.0),
+            ("46", 333.0, 643.0),
+            ("17", 333.0, 679.0),
+            ("57", 438.0, 650.0),
+            ("20", 438.0, 694.0),
+        ]
+        .iter()
+        .map(|&(t, x, y)| make_item(t, x, y, 9.0))
+        .collect();
+        let rects = chart_rects();
+        let regions = detect_chart_regions(&items, &rects, 1);
+        assert_eq!(regions.len(), 1, "expected one chart region");
+        let (tables, hints) = detect_tables_from_rects(&items, &rects, 1);
+        assert!(tables.is_empty(), "chart bars must not become a table");
+        assert!(hints.is_empty(), "chart bars must not become a hint region");
+    }
+
+    #[test]
+    fn dominant_page_backgrounds_are_normalized_only_after_repetition() {
+        let page_fill = (0.0, 0.0, 600.0, 800.0);
+        let cell = (100.0, 500.0, 120.0, 20.0);
+
+        let mut dominant = vec![page_fill; DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS];
+        dominant.push(cell);
+        assert_eq!(
+            without_page_backgrounds(&dominant, PageBackgroundRemoval::Repeated),
+            vec![cell]
+        );
+
+        let mut incidental = vec![page_fill; DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS - 1];
+        incidental.push(cell);
+        assert_eq!(
+            without_page_backgrounds(&incidental, PageBackgroundRemoval::Repeated),
+            incidental
+        );
+    }
+
+    #[test]
+    fn overwhelming_page_backgrounds_are_removed_before_grid_detection() {
+        let page_fill = PdfRect {
+            x: 0.0,
+            y: 0.0,
+            width: 600.0,
+            height: 800.0,
+            page: 1,
+        };
+        let mut rects = vec![page_fill; 12];
+        rects.extend([
+            PdfRect {
+                x: 70.0,
+                y: 320.0,
+                width: 240.0,
+                height: 260.0,
+                page: 1,
+            },
+            PdfRect {
+                x: 330.0,
+                y: 400.0,
+                width: 200.0,
+                height: 48.0,
+                page: 1,
+            },
+            PdfRect {
+                x: 115.0,
+                y: 70.0,
+                width: 150.0,
+                height: 12.0,
+                page: 1,
+            },
+        ]);
+        let items = vec![
+            make_item("body prose", 70.0, 700.0, 10.0),
+            make_item("continued body prose", 300.0, 620.0, 10.0),
+            make_item("Figure 6", 340.0, 430.0, 9.0),
+            make_item("caption", 410.0, 410.0, 9.0),
+            make_item("footnote", 120.0, 74.0, 8.0),
+        ];
+
+        let (tables, _) = detect_tables_from_rects(&items, &rects, 1);
+        assert!(
+            tables.is_empty(),
+            "duplicate page backgrounds must not manufacture a full-page table"
+        );
+    }
+
+    #[test]
+    fn minority_page_backgrounds_preserve_real_cell_grid() {
+        let page_fill = PdfRect {
+            x: 0.0,
+            y: 0.0,
+            width: 600.0,
+            height: 800.0,
+            page: 1,
+        };
+        let mut rects = vec![page_fill; DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS];
+        let mut items = Vec::new();
+        for row in 0..4 {
+            for col in 0..3 {
+                rects.push(PdfRect {
+                    x: 100.0 + col as f32 * 100.0,
+                    y: 600.0 - row as f32 * 24.0,
+                    width: 100.0,
+                    height: 24.0,
+                    page: 1,
+                });
+                items.push(make_item(
+                    "42",
+                    110.0 + col as f32 * 100.0,
+                    607.0 - row as f32 * 24.0,
+                    9.0,
+                ));
+            }
+        }
+
+        let (tables, _) = detect_tables_from_rects(&items, &rects, 1);
+        assert_eq!(tables.len(), 1, "a real repeated cell grid must survive");
+        assert_eq!(tables[0].rows.len(), 4);
+        assert_eq!(tables[0].columns.len(), 3);
+    }
+
+    #[test]
+    fn minority_page_backgrounds_do_not_expand_row_stripe_fallback() {
+        let page_fill = PdfRect {
+            x: 0.0,
+            y: 0.0,
+            width: 600.0,
+            height: 800.0,
+            page: 1,
+        };
+        let mut rects = vec![page_fill; DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS];
+        let mut items = Vec::new();
+        for row in 0..25 {
+            let y = 200.0 + row as f32 * 20.0;
+            rects.push(PdfRect {
+                x: 40.0,
+                y,
+                width: 510.0,
+                height: 16.0,
+                page: 1,
+            });
+            items.push(make_item(&format!("row {row}"), 60.0, y + 5.0, 9.0));
+            items.push(make_item(&format!("value {row}"), 320.0, y + 5.0, 9.0));
+        }
+
+        let (tables, _) = detect_tables_from_rects(&items, &rects, 1);
+        assert_eq!(tables.len(), 1, "the row-stripe table should survive");
+        assert_eq!(
+            tables[0].rows.len(),
+            25,
+            "page fills must not add full-page rows to the fallback grid"
+        );
+        assert_eq!(tables[0].columns.len(), 2);
+    }
+
+    #[test]
+    fn uniform_cell_grid_is_not_a_chart() {
+        // Touching, uniform-height cell rects (a real table) must not match:
+        // no inter-column gap and no bar-length variation.
+        let mut rects = Vec::new();
+        for row in 0..4 {
+            for col in 0..3 {
+                rects.push(PdfRect {
+                    x: 100.0 + col as f32 * 80.0,
+                    y: 600.0 - row as f32 * 20.0,
+                    width: 80.0,
+                    height: 20.0,
+                    page: 1,
+                });
+            }
+        }
+        let items: Vec<TextItem> = (0..4)
+            .flat_map(|r| {
+                (0..3).map(move |c| (100.0 + c as f32 * 80.0 + 10.0, 605.0 - r as f32 * 20.0))
+            })
+            .map(|(x, y)| make_item("42", x, y, 9.0))
+            .collect();
+        assert!(detect_chart_regions(&items, &rects, 1).is_empty());
+    }
+
+    #[test]
+    fn variable_height_ruled_grid_overrides_bar_hypothesis() {
+        let edge_sets = [
+            [80.0, 140.0, 200.0, 260.0, 320.0, 380.0, 440.0, 500.0, 560.0],
+            [80.0, 140.0, 210.0, 260.0, 320.0, 380.0, 450.0, 500.0, 560.0],
+        ];
+        let heights = [20.0, 34.0, 26.0, 42.0, 20.0, 34.0];
+        let edge_variants = [0, 0, 0, 0, 1, 1];
+        let mut rects = Vec::new();
+        let mut y = 650.0;
+        for (row, height) in heights.into_iter().enumerate() {
+            let edges = edge_sets[edge_variants[row]];
+            rects.extend(
+                edges
+                    .windows(2)
+                    .map(|edge| (edge[0], y, edge[1] - edge[0], height)),
+            );
+            y -= height;
+        }
+
+        assert!(is_repeated_cell_grid(&rects));
+        assert!(has_chart_bar_signature(&[], &rects, 1));
+        assert!(repeated_cell_grid_overrides_bar_hypothesis(&rects));
+        assert!(segmented_stacked_bar_geometry(&rects).is_none());
+        assert!(!is_chart_bar_cluster(&[], &rects, 1));
+
+        let mut with_page_fills =
+            vec![(0.0, 0.0, 600.0, 800.0); DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS];
+        with_page_fills.extend(rects);
+        assert!(!repeated_cell_grid_overrides_bar_hypothesis(
+            &with_page_fills
+        ));
+    }
+
+    #[test]
+    fn touching_segments_with_spaced_rows_remain_a_chart() {
+        let row_edges = [
+            [100.0, 140.0, 180.0, 220.0, 260.0],
+            [100.0, 140.0, 180.0, 228.0, 260.0],
+            [100.0, 140.0, 180.0, 214.0, 260.0],
+            [100.0, 140.0, 180.0, 232.0, 260.0],
+        ];
+        let mut raw_rects = vec![(90.0, 530.0, 190.0, 100.0)];
+        for (row, edges) in row_edges.into_iter().enumerate() {
+            let y = 540.0 + row as f32 * 20.0;
+            raw_rects.extend(
+                edges
+                    .windows(2)
+                    .map(|edge| (edge[0], y, edge[1] - edge[0], 12.0)),
+            );
+        }
+        let items: Vec<TextItem> = (0..4)
+            .map(|row| make_item("Category", 62.0, 541.0 + row as f32 * 20.0, 9.0))
+            .collect();
+
+        assert!(is_repeated_cell_grid(&raw_rects));
+        assert!(has_chart_bar_signature(&items, &raw_rects, 1));
+        let geometry = segmented_stacked_bar_geometry(&raw_rects).expect("segmented stack");
+        assert!(has_external_segmented_bar_labels(&items, 1, &geometry));
+        assert!(is_chart_bar_cluster(&items, &raw_rects, 1));
+
+        let numeric_items: Vec<TextItem> = (0..4)
+            .map(|row| make_item("2024", 80.0, 541.0 + row as f32 * 18.0, 9.0))
+            .collect();
+        assert!(has_external_segmented_bar_labels(
+            &numeric_items,
+            1,
+            &geometry
+        ));
+        assert!(is_chart_bar_cluster(&numeric_items, &raw_rects, 1));
+
+        let edge_adjacent_items: Vec<TextItem> = (0..4)
+            .map(|row| make_item("2024", 92.0, 541.0 + row as f32 * 18.0, 9.0))
+            .collect();
+        assert!(has_external_segmented_bar_labels(
+            &edge_adjacent_items,
+            1,
+            &geometry
+        ));
+        assert!(is_chart_bar_cluster(&edge_adjacent_items, &raw_rects, 1));
+
+        let far_items: Vec<TextItem> = (0..4)
+            .map(|row| make_item("Category", 20.0, 541.0 + row as f32 * 18.0, 9.0))
+            .collect();
+        assert!(!has_external_segmented_bar_labels(&far_items, 1, &geometry));
+        assert!(!is_chart_bar_cluster(&far_items, &raw_rects, 1));
+
+        let rects: Vec<PdfRect> = raw_rects
+            .into_iter()
+            .map(|(x, y, width, height)| PdfRect {
+                x,
+                y,
+                width,
+                height,
+                page: 1,
+            })
+            .collect();
+        assert_eq!(detect_chart_regions(&items, &rects, 1).len(), 1);
+        let (tables, hints) = detect_tables_from_rects(&items, &rects, 1);
+        assert!(tables.is_empty());
+        assert!(hints.is_empty());
+    }
+
+    #[test]
+    fn padded_numeric_grid_frame_remains_a_table() {
+        let row_edges = [
+            [100.0, 140.0, 180.0, 220.0, 260.0],
+            [100.0, 140.0, 180.0, 228.0, 260.0],
+            [100.0, 140.0, 180.0, 214.0, 260.0],
+            [100.0, 140.0, 180.0, 232.0, 260.0],
+        ];
+        let mut raw_rects = vec![(96.0, 536.0, 168.0, 80.0)];
+        let mut items = Vec::new();
+        for (row, edges) in row_edges.into_iter().enumerate() {
+            let y = 540.0 + row as f32 * 20.0;
+            for edge in edges.windows(2) {
+                raw_rects.push((edge[0], y, edge[1] - edge[0], 12.0));
+                items.push(make_item("42", edge[0] + 8.0, y + 1.0, 9.0));
+            }
+        }
+
+        assert!(is_repeated_cell_grid(&raw_rects));
+        assert!(has_chart_bar_signature(&items, &raw_rects, 1));
+        let geometry = segmented_stacked_bar_geometry(&raw_rects).expect("segmented rows");
+        assert!(!has_external_segmented_bar_labels(&items, 1, &geometry));
+        assert!(!is_chart_bar_cluster(&items, &raw_rects, 1));
+
+        let flush_items: Vec<TextItem> = (0..4)
+            .map(|row| make_item("1", 100.0, 541.0 + row as f32 * 20.0, 9.0))
+            .collect();
+        assert!(!has_external_segmented_bar_labels(
+            &flush_items,
+            1,
+            &geometry
+        ));
+        assert!(!is_chart_bar_cluster(&flush_items, &raw_rects, 1));
+
+        let rects: Vec<PdfRect> = raw_rects
+            .into_iter()
+            .map(|(x, y, width, height)| PdfRect {
+                x,
+                y,
+                width,
+                height,
+                page: 1,
+            })
+            .collect();
+        assert!(detect_chart_regions(&items, &rects, 1).is_empty());
+        assert!(!detect_tables_from_rects(&items, &rects, 1).0.is_empty());
+    }
+
+    #[test]
+    fn frameless_segmented_chart_with_category_labels_remains_a_chart() {
+        let row_edges = [
+            [100.0, 140.0, 180.0, 220.0, 260.0],
+            [100.0, 140.0, 180.0, 228.0, 260.0],
+            [100.0, 140.0, 180.0, 214.0, 260.0],
+            [100.0, 140.0, 180.0, 232.0, 260.0],
+        ];
+        let mut raw_rects = Vec::new();
+        let mut items = Vec::new();
+        for (row, edges) in row_edges.into_iter().enumerate() {
+            let y = 540.0 + row as f32 * 18.0;
+            raw_rects.extend(
+                edges
+                    .windows(2)
+                    .map(|edge| (edge[0], y, edge[1] - edge[0], 12.0)),
+            );
+            items.push(make_item("Category", 62.0, y + 1.0, 9.0));
+        }
+
+        let geometry = segmented_stacked_bar_geometry(&raw_rects).expect("segmented stack");
+        assert!(has_external_segmented_bar_labels(&items, 1, &geometry));
+        assert!(is_chart_bar_cluster(&items, &raw_rects, 1));
+
+        let rects: Vec<PdfRect> = raw_rects
+            .into_iter()
+            .map(|(x, y, width, height)| PdfRect {
+                x,
+                y,
+                width,
+                height,
+                page: 1,
+            })
+            .collect();
+        assert_eq!(detect_chart_regions(&items, &rects, 1).len(), 1);
+    }
+
+    // --- detect_stacked_box_table ---
+
+    /// N stacked boxes at x=100, w=300, h=22, top-to-bottom from y=600.
+    fn stacked_boxes(n: usize) -> Vec<(f32, f32, f32, f32)> {
+        (0..n)
+            .map(|i| (100.0, 600.0 - i as f32 * 22.0, 300.0, 22.0))
+            .collect()
+    }
+
+    #[test]
+    fn stacked_box_list_becomes_single_column_table() {
+        let rects = stacked_boxes(5);
+        let items: Vec<TextItem> = (0..5)
+            .map(|i| make_item("#1: Recycling Basics", 120.0, 605.0 - i as f32 * 22.0, 10.0))
+            .collect();
+        let table = detect_stacked_box_table(&items, &rects, 1).expect("stacked-box table");
+        assert_eq!(table.cells.len(), 5);
+        assert_eq!(table.cells[0].len(), 1);
+    }
+
+    #[test]
+    fn stacked_box_rejects_wrapped_sentences() {
+        // Line stripes behind flowing prose: rows continue mid-sentence.
+        let rects = stacked_boxes(4);
+        let texts = [
+            "the provisions of this section apply to",
+            "companies subject to tax under those",
+            "sections, except that the copy of the",
+            "annual statement must be retained.",
+        ];
+        let items: Vec<TextItem> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| make_item(t, 120.0, 605.0 - i as f32 * 22.0, 10.0))
+            .collect();
+        assert!(detect_stacked_box_table(&items, &rects, 1).is_none());
+    }
+
+    #[test]
+    fn stacked_box_rejects_flanking_text() {
+        // A ruled label column with plain-text data columns beside it is one
+        // column of a wider table, not a single-column list.
+        let rects = stacked_boxes(4);
+        let mut items = Vec::new();
+        for i in 0..4 {
+            let y = 605.0 - i as f32 * 22.0;
+            items.push(make_item("Section 1.382", 120.0, y, 10.0));
+            items.push(make_item("removed text", 450.0, y, 10.0)); // beside the box
+        }
+        assert!(detect_stacked_box_table(&items, &rects, 1).is_none());
+    }
+
+    #[test]
+    fn stacked_box_rejects_two_column_content() {
+        // Boxes holding two separated runs are striped multi-column content.
+        let rects = stacked_boxes(4);
+        let mut items = Vec::new();
+        for i in 0..4 {
+            let y = 605.0 - i as f32 * 22.0;
+            let mut left = make_item("left words", 110.0, y, 10.0);
+            left.width = 60.0;
+            let mut right = make_item("right words", 250.0, y, 10.0);
+            right.width = 60.0;
+            items.push(left);
+            items.push(right);
+        }
+        assert!(detect_stacked_box_table(&items, &rects, 1).is_none());
+    }
+
+    #[test]
+    fn stacked_box_rejects_mixed_height_stripes() {
+        // Mixed 13/27pt stripes (redline markup) — height uniformity splits
+        // the family and the gap check rejects the remainder.
+        let mut rects = Vec::new();
+        let mut y = 600.0;
+        for i in 0..8 {
+            let h = if i % 3 == 0 { 27.0 } else { 13.5 };
+            y -= h;
+            rects.push((100.0, y, 300.0, h));
+        }
+        let items: Vec<TextItem> = (0..8)
+            .map(|i| make_item("PART 602 OMB CONTROL", 120.0, 590.0 - i as f32 * 18.0, 10.0))
+            .collect();
+        assert!(detect_stacked_box_table(&items, &rects, 1).is_none());
+    }
+
+    // --- has_dominant_prose_cell ---
+
+    fn cells_of(rows: &[&[&str]]) -> Vec<Vec<String>> {
+        rows.iter()
+            .map(|r| r.iter().map(|c| c.to_string()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn dominant_prose_cell_rejects_swallowed_paragraph() {
+        // Two cells hold paragraphs (the shape every observed phantom grid
+        // has: swallowed body text spans multiple cells), rest are chart labels
+        let para = ["word"; 70].join(" ");
+        let para2 = ["word"; 35].join(" ");
+        let cells = cells_of(&[
+            &[para.as_str(), "81", "76"],
+            &[para2.as_str(), "56", "9"],
+            &["2019", "2020", ""],
+        ]);
+        assert!(has_dominant_prose_cell(&cells));
+    }
+
+    #[test]
+    fn dominant_prose_cell_rejects_small_table_dominated_by_one_cell() {
+        // Boundary case, documented as INTENDED: a small grid whose single
+        // long cell dominates the word count is rejected even at 4+ rows.
+        // By content alone this shape is indistinguishable from a phantom
+        // grid over body text, and every observed instance in the regression
+        // corpora was swallowed prose (chart/figure regions), not a real
+        // note table. Rejection degrades gracefully — the text is still
+        // extracted as prose — while accepting a phantom scrambles reading
+        // order.
+        let note = ["word"; 70].join(" ");
+        let cells = cells_of(&[
+            &["Purpose", note.as_str()],
+            &["Owner", "Facilities team"],
+            &["Date", "2024-06-01"],
+            &["Status", "Active"],
+        ]);
+        assert!(has_dominant_prose_cell(&cells));
+    }
+
+    #[test]
+    fn dominant_prose_cell_allows_description_column() {
+        // Long-ish description cells, but text is spread across the table
+        let desc = ["word"; 25].join(" ");
+        let cells = cells_of(&[
+            &["Item A", desc.as_str(), "100"],
+            &["Item B", desc.as_str(), "200"],
+            &["Item C", desc.as_str(), "300"],
+            &["Item D", desc.as_str(), "400"],
+        ]);
+        assert!(!has_dominant_prose_cell(&cells));
+    }
+
+    #[test]
+    fn dominant_prose_cell_allows_short_tables() {
+        let cells = cells_of(&[&["Name", "Value"], &["Total", "42"]]);
+        assert!(!has_dominant_prose_cell(&cells));
+    }
+
+    #[test]
+    fn dominant_prose_cell_allows_data_table_with_long_note() {
+        // A real 4+ row table with one verbose remark cell: the note is ≥60
+        // words but the table's other content carries more than 2× its word
+        // count, so concentration stays below the 1/3 threshold. The
+        // denominator scales with table size — this is what keeps large
+        // legitimate tables safe where a bare length cap would not.
+        let note = ["word"; 60].join(" ");
+        let row_text = ["data"; 12].join(" ");
+        let mut rows: Vec<Vec<String>> = (0..11)
+            .map(|i| {
+                vec![
+                    format!("Item {i}"),
+                    row_text.clone(),
+                    format!("{}", i * 100),
+                ]
+            })
+            .collect();
+        rows.push(vec!["Note".into(), note, String::new()]);
+        assert!(!has_dominant_prose_cell(&rows));
     }
 
     // --- rects_overlap ---
@@ -2424,6 +4287,113 @@ mod tests {
         assert_eq!(groups[0].len(), 2);
     }
 
+    #[test]
+    fn test_cluster_rects_overlapping_grid_still_clusters() {
+        // Neighboring cells overlap; the grid must still union the whole table.
+        let mut rects = Vec::new();
+        for row in 0..4 {
+            for col in 0..4 {
+                rects.push((col as f32 * 9.0, row as f32 * 9.0, 10.0, 10.0));
+            }
+        }
+        let groups = cluster_rects(&rects, 0.0, 1);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 16);
+    }
+
+    #[test]
+    fn test_cluster_rects_many_disjoint_stays_subquadratic() {
+        // Pairwise-disjoint rects never merge, so a component-size cap does
+        // not stop all-pairs overlap tests. Spread in X so they land in
+        // different grid cells; 8k is enough that n² tests would dominate.
+        let n = 8_000usize;
+        let rects: Vec<(f32, f32, f32, f32)> =
+            (0..n).map(|i| (i as f32 * 20.0, 0.0, 10.0, 10.0)).collect();
+        let groups = cluster_rects(&rects, 0.0, 2);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_cluster_rects_stacked_disjoint_does_not_starve_later_table() {
+        // Same X, spread in Y: a spatial grid must still union an overlapping
+        // pair in another region of the page.
+        let n = 8_000usize;
+        let mut rects: Vec<(f32, f32, f32, f32)> =
+            (0..n).map(|i| (0.0, i as f32 * 20.0, 10.0, 10.0)).collect();
+        rects.push((500.0, 0.0, 10.0, 10.0));
+        rects.push((508.0, 0.0, 10.0, 10.0));
+        let groups = cluster_rects(&rects, 0.0, 2);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn test_cluster_rects_oversized_span_still_unions() {
+        // Wider than 64 grid cells; must still union the small overlapping rect.
+        let rects = vec![(0.0, 0.0, 5000.0, 10.0), (4900.0, 0.0, 10.0, 10.0)];
+        let groups = cluster_rects(&rects, 0.0, 1);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn test_cluster_rects_many_oversized_spans_all_get_a_pass() {
+        // More than 32 huge rects: the last one must still union its overlap.
+        let mut rects: Vec<(f32, f32, f32, f32)> = (0..40)
+            .map(|i| (0.0, i as f32 * 20.0, 5000.0, 10.0))
+            .collect();
+        rects.push((4900.0, 39.0 * 20.0, 10.0, 10.0));
+        let groups = cluster_rects(&rects, 0.0, 2);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn test_cluster_rects_oversized_not_starved_by_earlier_disjoint() {
+        // 9k earlier disjoint drawings would exhaust an index-order cap of
+        // 8,192 before the overlapping cell is visited.
+        let mut rects: Vec<(f32, f32, f32, f32)> = (0..9_000)
+            .map(|i| (10_000.0, i as f32 * 20.0, 10.0, 10.0))
+            .collect();
+        let wide = rects.len();
+        rects.push((0.0, 0.0, 5000.0, 10.0));
+        let target = rects.len();
+        rects.push((4900.0, 0.0, 10.0, 10.0));
+        let groups = cluster_rects(&rects, 0.0, 2);
+        assert!(
+            groups
+                .iter()
+                .any(|g| g.contains(&wide) && g.contains(&target)),
+            "wide rule and far-end cell must share a cluster"
+        );
+    }
+
+    #[test]
+    fn test_cluster_rects_wide_and_tall_oversized_union() {
+        let rects = vec![(0.0, 0.0, 5000.0, 10.0), (0.0, 0.0, 10.0, 5000.0)];
+        let groups = cluster_rects(&rects, 0.0, 2);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn test_cluster_rects_dual_oversized_spans_coarse_y() {
+        let rects = vec![(0.0, 0.0, 5000.0, 5000.0), (0.0, 4500.0, 5000.0, 5000.0)];
+        let groups = cluster_rects(&rects, 0.0, 2);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn test_cluster_rects_many_wide_and_tall_stays_subquadratic() {
+        let mut rects = Vec::with_capacity(4_000);
+        for i in 0..2_000 {
+            rects.push((0.0, i as f32 * 20.0, 5000.0, 10.0));
+            rects.push((i as f32 * 20.0, 0.0, 10.0, 5000.0));
+        }
+        let _groups = cluster_rects(&rects, 0.0, 2);
+    }
+
     // --- snap_edges ---
 
     #[test]
@@ -2459,6 +4429,33 @@ mod tests {
     }
 
     // --- assign_items_to_grid ---
+
+    #[test]
+    fn long_vertical_runs_never_fill_a_cell() {
+        // A journal running head standing beside a turned table (a 200pt
+        // vertical run) covers the other row's band and must not be poured
+        // into the cell its foot touches; a rotated column header, 40pt tall
+        // and confined to its own header row, still fills its cell.
+        let mut running_head = make_item("Diversity and Distributions, 1-15", 15.0, 45.0, 9.0);
+        running_head.rotation = 90.0;
+        running_head.width = 9.0;
+        running_head.height = 200.0;
+        let mut header = make_item("Total", 55.0, 75.0, 9.0);
+        header.rotation = 90.0;
+        header.width = 9.0;
+        header.height = 40.0;
+        let items = vec![running_head, header, make_item("A", 15.0, 85.0, 10.0)];
+        let col_edges = vec![10.0, 50.0, 90.0];
+        let row_edges = vec![120.0, 70.0, 55.0, 40.0];
+        let (cells, indices) = assign_items_to_grid(&items, &col_edges, &row_edges, 1);
+        assert_eq!(indices, vec![1, 2]);
+        assert_eq!(cells[0][0], "A");
+        assert_eq!(cells[0][1], "Total");
+        assert!(
+            cells.iter().flatten().all(|c| !c.contains("Diversity")),
+            "{cells:?}"
+        );
+    }
 
     #[test]
     fn test_assign_items_basic() {
@@ -2512,6 +4509,21 @@ mod tests {
         assert_eq!(indices.len(), 2);
         assert!(cells[0][0].contains("Hello"));
         assert!(cells[0][0].contains("World"));
+    }
+
+    #[test]
+    fn test_assign_items_parenthetical_no_inner_spaces() {
+        let items = vec![
+            make_item("The first sentence", 15.0, 85.0, 10.0),
+            make_item("(", 90.0, 85.0, 10.0),
+            make_item("twice", 95.0, 85.0, 10.0),
+            make_item(")", 120.0, 85.0, 10.0),
+        ];
+        let col_edges = vec![10.0, 150.0];
+        let row_edges = vec![90.0, 70.0];
+        let (cells, indices) = assign_items_to_grid(&items, &col_edges, &row_edges, 1);
+        assert_eq!(indices.len(), 4);
+        assert_eq!(cells[0][0], "The first sentence (twice)");
     }
 
     #[test]
@@ -3235,6 +5247,49 @@ mod tests {
     }
 
     #[test]
+    fn stacked_box_three_rows_below_cluster_minimum() {
+        // Pins a deliberate precision gate: a 3-box stack stays below the
+        // main loop's 6-rect cluster minimum and is NOT detected end-to-end.
+        // Routing smaller clusters through detect_stacked_box_table was
+        // tried and regressed four pdf-evals documents (striped bullet
+        // lists, wrapped regulation text, stats-table columns) with no
+        // corpus gains — too few boxes for the anti-prose guards to work.
+        // If this ever becomes worth revisiting, the guards need stronger
+        // signals first; flipping this assertion is the entry point.
+        let mut rects: Vec<PdfRect> = (0..3)
+            .map(|i| PdfRect {
+                x: 100.0,
+                y: 600.0 - i as f32 * 22.0,
+                width: 300.0,
+                height: 22.0,
+                page: 1,
+            })
+            .collect();
+        // Unrelated scattered rects push the page past the 6-rect page gate
+        // so the run reaches clustering, while the 3-box stack itself stays
+        // below the 6-rect cluster minimum.
+        for i in 0..4 {
+            rects.push(PdfRect {
+                x: 100.0 + i as f32 * 120.0,
+                y: 100.0,
+                width: 40.0,
+                height: 15.0,
+                page: 1,
+            });
+        }
+        let items: Vec<TextItem> = ["Step One: Plan", "Step Two: Build", "Step Three: Ship"]
+            .iter()
+            .enumerate()
+            .map(|(i, t)| make_item(t, 120.0, 605.0 - i as f32 * 22.0, 10.0))
+            .collect();
+        let (tables, _) = detect_tables_from_rects(&items, &rects, 1);
+        assert!(
+            tables.is_empty(),
+            "3-box stacks are intentionally below the detection floor"
+        );
+    }
+
+    #[test]
     fn failed_cluster_generates_hint_with_items() {
         // A cluster of rects forming an outer border (2 x-edges after snapping)
         // that fails grid detection should produce a hint when items are inside.
@@ -3259,12 +5314,25 @@ mod tests {
                     width: 50.0,
                     height: 10.0,
                     font: String::new(),
+                    font_tag: String::new(),
+                    legacy_symbol_rewrite: false,
                     font_size: 10.0,
                     page: 1,
                     is_bold: false,
                     is_italic: false,
+                    font_weight: None,
+                    bold_source: None,
+                    fixed_pitch: None,
+                    fill_color: None,
+                    stroke_color: None,
+                    render_mode: None,
+                    is_underline: false,
+                    is_strikeout: false,
+                    rotation: 0.0,
+                    advance_known: true,
                     item_type: crate::types::ItemType::Text,
                     mcid: None,
+                    baseline_shift: 0.0,
                 });
             }
         }
@@ -3568,12 +5636,25 @@ mod tests {
                 width: 40.0,
                 height: 10.0,
                 font: String::new(),
+                font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: 10.0,
                 page: 1,
                 is_bold: false,
                 is_italic: false,
+                font_weight: None,
+                bold_source: None,
+                fixed_pitch: None,
+                fill_color: None,
+                stroke_color: None,
+                render_mode: None,
+                is_underline: false,
+                is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: crate::types::ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             });
         }
         let rects: Vec<crate::types::PdfRect> = page_rects

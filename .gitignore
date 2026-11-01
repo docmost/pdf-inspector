@@ -1,10 +1,13 @@
 # Rust build artifacts
 /target/
+/wasm/target/
+/wasm/pkg/
 debug/
 *.pdb
 
 # Cargo lock (optional for libraries)
 Cargo.lock
+!/wasm/Cargo.lock
 
 # IDE
 .idea/
@@ -28,15 +31,14 @@ Thumbs.db
 napi/index.js
 napi/index.d.ts
 
-# Local samples and scripts
+# Local samples
 samples/
-scripts/
 
 # Test output
 test_output/
+.firecrawl/
 
 # Python
 __pycache__/
 *.pyc
 .pytest_cache/
-
